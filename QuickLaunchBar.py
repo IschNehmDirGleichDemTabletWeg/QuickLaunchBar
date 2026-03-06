@@ -173,12 +173,12 @@ def resolve_lnk(lnk_path: str):
         return "", "", 0
 
 
-def best_icon(lnk_path: str):
+def best_icon(lnk_path: str, icon_size: int = 32):
     """Lädt Icon direkt aus der .lnk wie Windows Explorer – kein Target-Parsing nötig."""
-    return _shell_icon(lnk_path)
+    return _shell_icon(lnk_path, icon_size)
 
 
-def _shell_icon(path: str):
+def _shell_icon(path: str, icon_size: int = 32):
     try:
         import ctypes
         from ctypes import wintypes
@@ -207,11 +207,11 @@ def _shell_icon(path: str):
             hdc        = win32ui.CreateDCFromHandle(hdc_screen)
             hdc_mem    = hdc.CreateCompatibleDC()
             hbmp       = win32ui.CreateBitmap()
-            hbmp.CreateCompatibleBitmap(hdc, ICON_SIZE, ICON_SIZE)
+            hbmp.CreateCompatibleBitmap(hdc, icon_size, icon_size)
             hdc_mem.SelectObject(hbmp)
-            hdc_mem.FillSolidRect((0, 0, ICON_SIZE, ICON_SIZE), 0x1c1c1c)
+            hdc_mem.FillSolidRect((0, 0, icon_size, icon_size), 0x1c1c1c)
             win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon,
-                                ICON_SIZE, ICON_SIZE, 0, None, win32con.DI_NORMAL)
+                                icon_size, icon_size, 0, None, win32con.DI_NORMAL)
             bmpinfo = hbmp.GetInfo()
             bmpdata = hbmp.GetBitmapBits(True)
             img = Image.frombuffer(
@@ -221,7 +221,7 @@ def _shell_icon(path: str):
             )
             win32gui.ReleaseDC(0, hdc_screen)
             win32gui.DestroyIcon(hicon)
-            return img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+            return img.resize((icon_size, icon_size), Image.LANCZOS)
     except Exception:
         pass
     return None
@@ -230,10 +230,10 @@ def _shell_icon(path: str):
 # ── Icon Button (Frame+Label, zuverlässiges Image-Rendering) ──────────────────
 
 class IconButton(tk.Frame):
-    def __init__(self, parent, name, img, on_click, on_right_click, **kw):
+    def __init__(self, parent, name, img, btn_size, on_click, on_right_click, **kw):
         super().__init__(
             parent,
-            width=BTN_SIZE, height=BTN_SIZE,
+            width=btn_size, height=btn_size,
             bg=BTN_NORM,
             highlightthickness=1,
             highlightbackground=BORDER,
@@ -330,8 +330,10 @@ class QuickLaunchBar:
 
         self._btn_frame = tk.Frame(inner, bg=BG)
         self._btn_frame.pack()
-        self._cols     = reg_get("Columns", 8)
-        self._max_rows = reg_get("MaxRows", 0)
+        self._cols      = reg_get("Columns", 8)
+        self._max_rows  = reg_get("MaxRows", 0)
+        self._icon_size = reg_get("IconSize", 32)
+        self._tb_pos    = reg_get("TaskbarPos", "bottom")  # bottom/top/left/right
 
         self._images  = {}  # key=filename, value=ImageTk – niemals löschen (GC-Schutz)
         self._load_shortcuts()
@@ -340,30 +342,43 @@ class QuickLaunchBar:
 
     def _position_window(self):
         self.root.update_idletasks()
-        w = self.root.winfo_reqwidth()
-        h = self.root.winfo_reqheight()
-
-        # Monitor wo die Maus gerade ist
+        w  = self.root.winfo_reqwidth()
+        h  = self.root.winfo_reqheight()
         mx = self.root.winfo_pointerx()
         my = self.root.winfo_pointery()
 
-        # Arbeitsbereich des aktuellen Monitors via tkinter
-        # Fallback: alle Monitore via screeninfo wenn vorhanden
+        # Monitor ermitteln
         try:
             import screeninfo
-            for m in screeninfo.get_monitors():
-                if m.x <= mx < m.x + m.width and m.y <= my < m.y + m.height:
-                    x = m.x + m.width  - w - 10
-                    y = m.y + m.height - h - 58
-                    self.root.geometry(f"+{x}+{y}")
-                    return
-        except ImportError:
-            pass
+            monitors = screeninfo.get_monitors()
+            mon = next((m for m in monitors
+                        if m.x <= mx < m.x + m.width
+                        and m.y <= my < m.y + m.height), monitors[0])
+            mx0, my0, mw, mh = mon.x, mon.y, mon.width, mon.height
+        except Exception:
+            mx0, my0 = 0, 0
+            mw = self.root.winfo_screenwidth()
+            mh = self.root.winfo_screenheight()
 
-        # Fallback: primärer Monitor
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"+{sw - w - 10}+{sh - h - 58}")
+        GAP = 8
+        pos = self._tb_pos
+        if pos == "bottom":
+            x = mx0 + mw - w - GAP
+            y = my0 + mh - h - 50
+        elif pos == "top":
+            x = mx0 + mw - w - GAP
+            y = my0 + 50
+        elif pos == "left":
+            x = mx0 + 50
+            y = my0 + mh - h - GAP
+        elif pos == "right":
+            x = mx0 + mw - w - 50
+            y = my0 + mh - h - GAP
+        else:
+            x = mx0 + mw - w - GAP
+            y = my0 + mh - h - 50
+
+        self.root.geometry(f"+{x}+{y}")
 
     def _drag_start(self, e):
         self._dx = e.x_root - self.root.winfo_x()
@@ -403,20 +418,22 @@ class QuickLaunchBar:
             and f.lower() != "desktop.ini"
         )
 
+        icon_size = self._icon_size
+        btn_size  = icon_size + 8
+
         for col, filename in enumerate(files):
             row = col // self._cols
-            # MaxRows begrenzen
             if self._max_rows > 0 and row >= self._max_rows:
                 break
             lnk      = os.path.join(QUICK_LAUNCH, filename)
             name     = os.path.splitext(filename)[0]
-            pil_img  = best_icon(lnk)
+            pil_img  = best_icon(lnk, icon_size)
             img = ImageTk.PhotoImage(pil_img) if pil_img else None
             if img:
                 self._images[filename] = img
 
             btn = IconButton(
-                self._btn_frame, name, img,
+                self._btn_frame, name, img, btn_size,
                 on_click       = lambda p=lnk: self._launch(p),
                 on_right_click = lambda e, p=lnk, n=name: self._ctx(e, p, n),
             )
@@ -541,14 +558,13 @@ class QuickLaunchBar:
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
-        # Center on screen
         win.update_idletasks()
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        w, h = 260, 140
+        w, h = 300, 220
         win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-        pad = dict(padx=12, pady=6)
+        pad = dict(padx=12, pady=5)
 
         tk.Label(win, text="Spalten:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", **pad)
@@ -563,21 +579,41 @@ class QuickLaunchBar:
         tk.Spinbox(win, from_=0, to=20, textvariable=var_rows, width=6,
                    bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
                    insertbackground="white").grid(row=1, column=1, sticky="w", **pad)
-        tk.Label(win, text="(0 = automatisch)", bg="#2d2d2d", fg="#888888",
+        tk.Label(win, text="(0 = auto)", bg="#2d2d2d", fg="#888888",
                  font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w")
 
+        tk.Label(win, text="Icon-Größe:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", **pad)
+        var_icon = tk.IntVar(value=reg_get("IconSize", 32))
+        tk.OptionMenu(win, var_icon, 16, 24, 32, 48).grid(row=2, column=1, sticky="w", **pad)
+
+        tk.Label(win, text="Taskleiste:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=3, column=0, sticky="w", **pad)
+        var_pos = tk.StringVar(value=reg_get("TaskbarPos", "bottom"))
+        tb_options = {"Unten": "bottom", "Oben": "top",
+                      "Links": "left",   "Rechts": "right"}
+        # Reverse lookup für Anzeige
+        pos_display = {v: k for k, v in tb_options.items()}
+        var_pos_label = tk.StringVar(value=pos_display.get(var_pos.get(), "Unten"))
+        om = tk.OptionMenu(win, var_pos_label, *tb_options.keys())
+        om.grid(row=3, column=1, sticky="w", **pad)
+
         def on_ok():
-            reg_set("Columns", var_cols.get())
-            reg_set("MaxRows", var_rows.get())
-            self._cols = var_cols.get()
-            self._max_rows = var_rows.get()
+            reg_set("Columns",    var_cols.get())
+            reg_set("MaxRows",    var_rows.get())
+            reg_set("IconSize",   var_icon.get())
+            reg_set("TaskbarPos", tb_options[var_pos_label.get()])
+            self._cols      = var_cols.get()
+            self._max_rows  = var_rows.get()
+            self._icon_size = var_icon.get()
+            self._tb_pos    = tb_options[var_pos_label.get()]
             self._load_shortcuts()
             win.destroy()
 
         tk.Button(win, text="OK", command=on_ok, width=8,
                   bg="#464646", fg="white", relief="flat",
                   activebackground="#5a5a5a",
-                  cursor="hand2").grid(row=2, column=0, columnspan=3, pady=12)
+                  cursor="hand2").grid(row=4, column=0, columnspan=3, pady=12)
 
     def run(self):
         self.root.mainloop()
