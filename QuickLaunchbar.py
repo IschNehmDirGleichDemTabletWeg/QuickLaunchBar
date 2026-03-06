@@ -1,12 +1,37 @@
 """
-QuickLaunchBar.py  –  v1.1
-Zeigt alle Verknüpfungen aus dem Quick Launch Ordner als Icon-Leiste.
-Benötigt: pip install pillow pywin32
+QuickLaunchBar.py  –  v1.6
+Displays all shortcuts from the Quick Launch folder as an icon bar.
+Requires: pip install pillow pywin32
 
-Änderungen v1.1:
-  - Settings werden nicht mehr in der Registry gespeichert,
-    sondern in einer settings.json neben der EXE (portabel, kein Installer nötig)
-  - Migration: vorhandene Registry-Werte werden beim ersten Start automatisch übernommen
+Changes v1.1:
+  - Settings are no longer stored in the registry,
+    but in a settings.json next to the EXE (portable, no installer needed)
+  - Migration: existing registry values are automatically imported on first run
+
+Changes v1.2:
+  - Window starts hidden – only the tray icon is visible on startup
+  - Tray icon is properly removed on exit (no ghost icon)
+
+Changes v1.3:
+  - Icons can be manually reordered via drag & drop
+  - Blue indicator shows the target position while dragging
+  - Semi-transparent ghost image follows the mouse
+  - Order is automatically saved in settings.json
+  - Click vs. drag is distinguished by a 5px threshold
+
+Changes v1.4:
+  - Ctrl + Mouse Wheel to dynamically change icon size
+  - Ctrl + Right-click on empty area opens Explorer in the Quick Launch folder
+  - Extended icon size list: 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48
+
+Changes v1.5:
+  - Clicking the app name in the tray menu opens the Quick Launch folder in Explorer
+  - Tray icon tooltip shows a hint about this feature
+
+Changes v1.6:
+  - Tray context menu now auto-hides the icon bar when dismissed
+
+
 """
 
 import os
@@ -25,7 +50,7 @@ import win32ui
 import win32con
 import win32api
 
-VERSION = "1.2"
+VERSION = "1.6"
 
 # ── Single Instance Guard ─────────────────────────────────────────────────────
 _MUTEX_NAME = "QuickLaunchBar_SingleInstance_Mutex"
@@ -38,7 +63,6 @@ if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
 # ── Settings (JSON) ───────────────────────────────────────────────────────────
 
 def _settings_path() -> str:
-    """settings.json liegt immer neben der EXE / dem Skript."""
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
@@ -53,7 +77,7 @@ DEFAULTS = {
     "TaskbarPos":  "bottom-right",
     "OffsetX":     8,
     "OffsetY":     50,
-    "Order":       [],   # manuelle Icon-Reihenfolge (Dateinamen)
+    "Order":       [],
 }
 
 _settings: dict = {}
@@ -69,8 +93,7 @@ def _load_settings():
             _settings = {}
     else:
         _settings = {}
-        _migrate_from_registry()   # einmalige Migration
-    # Fehlende Schlüssel mit Defaults auffüllen
+        _migrate_from_registry()
     for k, v in DEFAULTS.items():
         _settings.setdefault(k, v)
 
@@ -89,7 +112,6 @@ def cfg_set(name: str, value):
     _save_settings()
 
 def _migrate_from_registry():
-    """Liest alte Registry-Werte und übernimmt sie in die neue JSON."""
     try:
         import winreg
         REG_KEY = r"Software\QuickLaunchBar"
@@ -110,12 +132,9 @@ def _migrate_from_registry():
             except Exception:
                 pass
         winreg.CloseKey(key)
-        print("Registry-Werte erfolgreich nach settings.json migriert.")
     except Exception:
-        pass  # Keine Registry-Werte vorhanden – kein Problem
+        pass
 
-
-# Settings beim Start laden
 _load_settings()
 
 
@@ -125,18 +144,19 @@ QUICK_LAUNCH = os.path.expandvars(
     r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch"
 )
 
-PAD      = 6
-BG       = "#1c1c1c"
-BTN_NORM = "#2d2d2d"
-BTN_HOVER= "#464646"
-BTN_PRESS= "#5f5f5f"
-BORDER   = "#4b4b4b"
+PAD       = 6
+BG        = "#1c1c1c"
+BTN_NORM  = "#2d2d2d"
+BTN_HOVER = "#464646"
+BTN_PRESS = "#5f5f5f"
+BORDER    = "#4b4b4b"
+DRAG_IND  = "#3a7bd5"   # Blauer Drop-Indikator
+DRAG_THRESHOLD = 5      # px bis Drag startet
 
 
 # ── Icon extraction ───────────────────────────────────────────────────────────
 
 def best_icon(path: str, icon_size: int = 32):
-    """Lädt Icon direkt aus der .lnk wie Windows Explorer."""
     try:
         from ctypes import wintypes
         shell32 = ctypes.windll.shell32
@@ -150,13 +170,10 @@ def best_icon(path: str, icon_size: int = 32):
                 ("szTypeName",    ctypes.c_wchar * 80),
             ]
 
-        SHGFI_ICON      = 0x000000100
-        SHGFI_LARGEICON = 0x000000000
-
         info = SHFILEINFO()
         res  = shell32.SHGetFileInfoW(
             path, 0, ctypes.byref(info), ctypes.sizeof(info),
-            SHGFI_ICON | SHGFI_LARGEICON
+            0x000000100 | 0x000000000   # SHGFI_ICON | SHGFI_LARGEICON
         )
         if res and info.hIcon:
             hicon      = info.hIcon
@@ -187,7 +204,8 @@ def best_icon(path: str, icon_size: int = 32):
 # ── Icon Button ───────────────────────────────────────────────────────────────
 
 class IconButton(tk.Frame):
-    def __init__(self, parent, name, img, btn_size, on_click, on_right_click, **kw):
+    def __init__(self, parent, name, img, btn_size, on_click, on_right_click,
+                 on_drag_start, on_drag_motion, on_drag_end, **kw):
         super().__init__(
             parent,
             width=btn_size, height=btn_size,
@@ -197,10 +215,18 @@ class IconButton(tk.Frame):
             **kw
         )
         self.pack_propagate(False)
-        self._img_ref   = img
-        self._name      = name
-        self._on_click  = on_click
-        self._on_rclick = on_right_click
+        self._img_ref      = img
+        self._name         = name
+        self._on_click     = on_click
+        self._on_rclick    = on_right_click
+        self._on_drag_start  = on_drag_start
+        self._on_drag_motion = on_drag_motion
+        self._on_drag_end    = on_drag_end
+
+        # Drag-State
+        self._press_x   = 0
+        self._press_y   = 0
+        self._dragging  = False
 
         lbl = tk.Label(self, bg=BTN_NORM, cursor="hand2")
         if img:
@@ -214,6 +240,7 @@ class IconButton(tk.Frame):
             w.bind("<Enter>",           self._hover_on)
             w.bind("<Leave>",           self._hover_off)
             w.bind("<ButtonPress-1>",   self._press)
+            w.bind("<B1-Motion>",       self._motion)
             w.bind("<ButtonRelease-1>", self._release)
             w.bind("<Button-3>",        self._right)
 
@@ -223,21 +250,49 @@ class IconButton(tk.Frame):
             w.bind("<Enter>", self._tip_schedule, add="+")
             w.bind("<Leave>", self._tip_hide,     add="+")
 
+    # ── Hover ────────────────────────────────────────────────────────────────
     def _hover_on(self, e):
-        self.configure(bg=BTN_HOVER)
-        for c in self.winfo_children(): c.configure(bg=BTN_HOVER)
+        if not self._dragging:
+            self.configure(bg=BTN_HOVER)
+            for c in self.winfo_children(): c.configure(bg=BTN_HOVER)
     def _hover_off(self, e):
-        self.configure(bg=BTN_NORM)
-        for c in self.winfo_children(): c.configure(bg=BTN_NORM)
+        if not self._dragging:
+            self.configure(bg=BTN_NORM)
+            for c in self.winfo_children(): c.configure(bg=BTN_NORM)
+
+    # ── Click / Drag ─────────────────────────────────────────────────────────
     def _press(self, e):
+        self._press_x  = e.x_root
+        self._press_y  = e.y_root
+        self._dragging = False
         self.configure(bg=BTN_PRESS)
         for c in self.winfo_children(): c.configure(bg=BTN_PRESS)
+
+    def _motion(self, e):
+        if self._dragging:
+            self._on_drag_motion(e.x_root, e.y_root)
+            return
+        dx = abs(e.x_root - self._press_x)
+        dy = abs(e.y_root - self._press_y)
+        if dx > DRAG_THRESHOLD or dy > DRAG_THRESHOLD:
+            self._dragging = True
+            self._tip_hide(e)          # Tooltip sofort weg
+            self.configure(bg=BTN_NORM)
+            for c in self.winfo_children(): c.configure(bg=BTN_NORM)
+            self._on_drag_start(self, e.x_root, e.y_root)
+
     def _release(self, e):
-        self._hover_on(e)
-        self._on_click()
+        if self._dragging:
+            self._dragging = False
+            self._on_drag_end(e.x_root, e.y_root)
+        else:
+            self._hover_on(e)
+            self._on_click()
+
     def _right(self, e):
         self._on_rclick(e)
 
+    # ── Tooltip ──────────────────────────────────────────────────────────────
     def _tip_schedule(self, e):
         self._tip_cancel()
         self._tip_destroy()
@@ -255,7 +310,7 @@ class IconButton(tk.Frame):
 
     def _tip_show(self):
         self._tip_job = None
-        if self._tip:
+        if self._tip or self._dragging:
             return
         x = self.winfo_rootx() + self.winfo_width() // 2
         y = self.winfo_rooty() - 28
@@ -268,9 +323,16 @@ class IconButton(tk.Frame):
                  font=("Segoe UI", 9), padx=6, pady=3,
                  relief="flat").pack()
 
-    def _tip_hide(self, e):
+    def _tip_hide(self, e=None):
         self._tip_cancel()
         self._tip_destroy()
+
+    def set_indicator(self, show: bool):
+        """Blauen Rahmen als Drop-Indikator ein/ausschalten."""
+        if show:
+            self.configure(highlightthickness=2, highlightbackground=DRAG_IND)
+        else:
+            self.configure(highlightthickness=1, highlightbackground=BORDER)
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -287,6 +349,7 @@ class QuickLaunchBar:
 
         self.root.bind("<FocusOut>", self._on_focus_out)
         self.root.bind("<Escape>",   lambda e: self.root.withdraw())
+        self.root.bind("<Control-MouseWheel>", self._on_ctrl_scroll)
 
         frame = tk.Frame(self.root, bg=BORDER, padx=1, pady=1)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -294,21 +357,29 @@ class QuickLaunchBar:
         inner = tk.Frame(frame, bg=BG, padx=PAD, pady=PAD)
         inner.pack(fill=tk.BOTH, expand=True)
 
-        inner.bind("<ButtonPress-1>", self._drag_start)
-        inner.bind("<B1-Motion>",     self._drag_move)
+        inner.bind("<ButtonPress-1>",   self._drag_start)
+        inner.bind("<B1-Motion>",       self._drag_move)
 
         self._btn_frame = tk.Frame(inner, bg=BG)
         self._btn_frame.pack()
+
+        # Drag & Drop State
+        self._ghost       = None   # Toplevel Geisterbild
+        self._ghost_img   = None
+        self._drag_btn    = None   # Button der gerade gezogen wird
+        self._drag_idx    = None   # Index des gezogenen Icons
+        self._drop_idx    = None   # aktueller Ziel-Index
+        self._buttons     = []     # Liste aller IconButtons in Reihenfolge
+        self._filenames   = []     # parallel zu _buttons: Dateinamen
 
         self._reload_cfg()
         self._images = {}
         self._load_shortcuts()
         self._position_window()
-        self.root.withdraw()   # beim Start versteckt – nur Tray sichtbar
+        self.root.withdraw()
         self._setup_tray()
 
     def _reload_cfg(self):
-        """Liest alle Einstellungen aus dem Settings-Dict."""
         self._cols         = cfg_get("Columns")
         self._max_rows     = cfg_get("MaxRows")
         self._icon_size    = cfg_get("IconSize")
@@ -317,7 +388,7 @@ class QuickLaunchBar:
         self._offset_x     = cfg_get("OffsetX")
         self._offset_y     = cfg_get("OffsetY")
 
-    # ── Position & Drag ───────────────────────────────────────────────────────
+    # ── Position & Window-Drag ────────────────────────────────────────────────
 
     def _position_window(self):
         self.root.update_idletasks()
@@ -353,12 +424,34 @@ class QuickLaunchBar:
     def _drag_move(self, e):
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
+    def _on_ctrl_scroll(self, e):
+        """Ctrl + Mausrad → Icon-Größe dynamisch ändern."""
+        SIZES = [8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+        current = self._icon_size
+        if current not in SIZES:
+            # Nächstgelegenen Wert finden
+            current = min(SIZES, key=lambda s: abs(s - current))
+        idx = SIZES.index(current)
+        if e.delta > 0:
+            idx = min(idx + 1, len(SIZES) - 1)   # größer
+        else:
+            idx = max(idx - 1, 0)                  # kleiner
+        new_size = SIZES[idx]
+        if new_size != self._icon_size:
+            cfg_set("IconSize", new_size)
+            self._icon_size = new_size
+            self._load_shortcuts()
+
+    def _open_quick_launch(self, e=None):
+        """Opens the Quick Launch folder in Windows Explorer."""
+        subprocess.Popen(f'explorer "{QUICK_LAUNCH}"')
+
     def _on_focus_out(self, e):
         self.root.after(150, self._check_focus)
 
     def _check_focus(self):
         try:
-            if self.root.focus_get() is None:
+            if self.root.focus_get() is None and self._ghost is None:
                 self.root.withdraw()
         except Exception:
             self.root.withdraw()
@@ -368,6 +461,8 @@ class QuickLaunchBar:
     def _load_shortcuts(self):
         for w in self._btn_frame.winfo_children():
             w.destroy()
+        self._buttons   = []
+        self._filenames = []
 
         if not os.path.exists(QUICK_LAUNCH):
             tk.Label(self._btn_frame,
@@ -383,8 +478,7 @@ class QuickLaunchBar:
             and f.lower() != "desktop.ini"
         )
 
-        # Gespeicherte Reihenfolge anwenden
-        order = cfg_get("Order")
+        order   = cfg_get("Order")
         ordered = [f for f in order if f in all_files]
         rest    = [f for f in all_files if f not in ordered]
         files   = ordered + rest
@@ -407,10 +501,146 @@ class QuickLaunchBar:
 
             btn = IconButton(
                 self._btn_frame, name, img, btn_size,
-                on_click       = lambda p=lnk: self._launch(p),
-                on_right_click = lambda e, p=lnk, n=name: self._ctx(e, p, n),
+                on_click        = lambda p=lnk: self._launch(p),
+                on_right_click  = lambda e, p=lnk, n=name: self._ctx(e, p, n),
+                on_drag_start   = lambda b=None, x=0, y=0, i=idx: self._icon_drag_start(i, b, x, y),
+                on_drag_motion  = self._icon_drag_motion,
+                on_drag_end     = self._icon_drag_end,
             )
             btn.grid(row=row, column=idx % self._cols, padx=sp, pady=sp)
+            self._buttons.append(btn)
+            self._filenames.append(filename)
+
+    # ── Icon Drag & Drop ──────────────────────────────────────────────────────
+
+    def _icon_drag_start(self, idx, btn, x, y):
+        self._drag_idx = idx
+        self._drag_btn = btn
+        self._drop_idx = idx
+
+        # Geisterbild erstellen: Icon halbtransparent
+        icon_size = self._icon_size
+        btn_size  = icon_size + 8
+        filename  = self._filenames[idx]
+
+        pil_img = None
+        if filename in self._images:
+            # Aus dem ImageTk zurück zu PIL
+            try:
+                img_tk = self._images[filename]
+                # Neue PIL Image mit Transparenz aus dem gecachten Icon
+                lnk = os.path.join(QUICK_LAUNCH, filename)
+                pil_img = best_icon(lnk, icon_size)
+            except Exception:
+                pass
+
+        self._ghost = tk.Toplevel(self.root)
+        self._ghost.wm_overrideredirect(True)
+        self._ghost.wm_attributes("-topmost", True)
+        self._ghost.wm_attributes("-alpha", 0.6)
+        self._ghost.configure(bg=BTN_HOVER)
+
+        ghost_frame = tk.Frame(
+            self._ghost,
+            width=btn_size, height=btn_size,
+            bg=BTN_HOVER,
+            highlightthickness=1,
+            highlightbackground=DRAG_IND
+        )
+        ghost_frame.pack_propagate(False)
+        ghost_frame.pack()
+
+        if pil_img:
+            self._ghost_img = ImageTk.PhotoImage(pil_img)
+            lbl = tk.Label(ghost_frame, image=self._ghost_img, bg=BTN_HOVER)
+            lbl._img = self._ghost_img
+        else:
+            lbl = tk.Label(ghost_frame,
+                           text=self._filenames[idx][:4],
+                           fg="white", bg=BTN_HOVER,
+                           font=("Segoe UI", 7))
+        lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+        offset = btn_size // 2
+        self._ghost.wm_geometry(f"+{x - offset}+{y - offset}")
+
+        # Drag-Button leicht ausblenden
+        btn.configure(bg="#1c1c1c")
+        for c in btn.winfo_children(): c.configure(bg="#1c1c1c")
+
+    def _icon_drag_motion(self, x, y):
+        if self._ghost is None:
+            return
+
+        # Geisterbild bewegen
+        btn_size = self._icon_size + 8
+        offset   = btn_size // 2
+        self._ghost.wm_geometry(f"+{x - offset}+{y - offset}")
+
+        # Alten Indikator löschen
+        if self._drop_idx is not None and self._drop_idx < len(self._buttons):
+            self._buttons[self._drop_idx].set_indicator(False)
+
+        # Ziel-Index bestimmen: welcher Button liegt unter der Maus?
+        new_drop = self._find_drop_index(x, y)
+        self._drop_idx = new_drop
+
+        # Neuen Indikator setzen
+        if new_drop is not None and new_drop < len(self._buttons):
+            self._buttons[new_drop].set_indicator(True)
+
+    def _icon_drag_end(self, x, y):
+        # Indikator entfernen
+        if self._drop_idx is not None and self._drop_idx < len(self._buttons):
+            self._buttons[self._drop_idx].set_indicator(False)
+
+        # Geisterbild zerstören
+        if self._ghost:
+            self._ghost.destroy()
+            self._ghost     = None
+            self._ghost_img = None
+
+        # Reihenfolge neu setzen wenn sinnvoll
+        drag_idx = self._drag_idx
+        drop_idx = self._drop_idx
+
+        self._drag_btn  = None
+        self._drag_idx  = None
+        self._drop_idx  = None
+
+        if drag_idx is not None and drop_idx is not None and drag_idx != drop_idx:
+            # Filenames umsortieren
+            files = list(self._filenames)
+            item  = files.pop(drag_idx)
+            files.insert(drop_idx, item)
+            cfg_set("Order", files)
+            self._load_shortcuts()
+        else:
+            # Drag abgebrochen – Button-Farbe zurücksetzen
+            if drag_idx is not None and drag_idx < len(self._buttons):
+                self._buttons[drag_idx].configure(bg=BTN_NORM)
+                for c in self._buttons[drag_idx].winfo_children():
+                    c.configure(bg=BTN_NORM)
+
+    def _find_drop_index(self, x, y) -> int | None:
+        """Gibt den Index des Buttons zurück der am nächsten zur Mausposition liegt."""
+        best_idx  = None
+        best_dist = float("inf")
+        for i, btn in enumerate(self._buttons):
+            if i == self._drag_idx:
+                continue
+            try:
+                bx = btn.winfo_rootx() + btn.winfo_width()  // 2
+                by = btn.winfo_rooty() + btn.winfo_height() // 2
+                dist = (x - bx) ** 2 + (y - by) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx  = i
+            except Exception:
+                pass
+        return best_idx
+
+    # ── Launch & Context Menu ─────────────────────────────────────────────────
 
     def _launch(self, lnk_path):
         try:
@@ -490,7 +720,6 @@ class QuickLaunchBar:
                     win32con.LR_LOADFROMFILE)
             except Exception:
                 hicon = None
-
         if not hicon:
             try:
                 hicon = win32gui.LoadImage(
@@ -498,7 +727,6 @@ class QuickLaunchBar:
                     win32con.IMAGE_ICON, 16, 16, win32con.LR_DEFAULTCOLOR)
             except Exception:
                 hicon = None
-
         if not hicon:
             try:
                 large, small = win32gui.ExtractIconEx(exe, 0)
@@ -508,14 +736,13 @@ class QuickLaunchBar:
                     except: pass
             except Exception:
                 hicon = None
-
         if not hicon:
             hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 
         win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, (
             hwnd, TRAY_ID,
             win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
-            WM_TRAY, hicon, f"Quick Launch Bar v{VERSION}"))
+            WM_TRAY, hicon, f"Quick Launch Bar v{VERSION}\nClick to open Quick Launch folder"))
 
         win32gui.PumpMessages()
 
@@ -526,18 +753,31 @@ class QuickLaunchBar:
         self.root.focus_force()
 
     def _tray_menu(self):
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+
         menu = tk.Menu(self.root, tearoff=0,
                        bg="#2d2d2d", fg="white",
                        activebackground="#464646",
                        activeforeground="white")
-        menu.add_command(label=f"Quick Launch Bar v{VERSION}", state="disabled")
+        menu.add_command(label=f"Quick Launch Bar v{VERSION}  📂",
+                         foreground="#aaaaaa",
+                         command=self._open_quick_launch)
         menu.add_separator()
         menu.add_command(label="Reload",      command=self._load_shortcuts)
         menu.add_command(label="Settings...", command=self._show_settings)
         menu.add_separator()
         menu.add_command(label="Exit",        command=self._quit)
-        menu.tk_popup(self.root.winfo_pointerx(),
-                      self.root.winfo_pointery())
+
+        # Hauptfenster zuerst verstecken, dann Hilfsfenster für Fokus
+        self.root.withdraw()
+        helper = tk.Toplevel(self.root)
+        helper.overrideredirect(True)
+        helper.geometry("1x1+0+0")
+        helper.attributes("-alpha", 0)
+        helper.focus_force()
+        menu.bind("<Unmap>", lambda e: helper.destroy())
+        menu.post(x, y)
 
     # ── Settings window ───────────────────────────────────────────────────────
 
@@ -581,7 +821,7 @@ class QuickLaunchBar:
                  font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", **pad)
         var_icon = tk.StringVar(value=str(cfg_get("IconSize")))
         ttk.Combobox(win, textvariable=var_icon,
-                     values=["8", "12", "16", "20", "24", "28", "32", "48"],
+                     values=["8", "12", "16", "20", "24", "28", "32", "36", "40", "44", "48"],
                      width=6, state="readonly").grid(row=2, column=1, sticky="w", **pad)
 
         tk.Label(win, text="Icon Spacing (px):", bg="#2d2d2d", fg="white",
@@ -637,8 +877,9 @@ class QuickLaunchBar:
                   activebackground="#5a5a5a",
                   cursor="hand2").grid(row=8, column=0, columnspan=3, pady=8)
 
+    # ── Quit ──────────────────────────────────────────────────────────────────
+
     def _quit(self):
-        """Tray-Icon sauber entfernen bevor das Fenster geschlossen wird."""
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (
                 self._tray_hwnd, self._tray_id,
