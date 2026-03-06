@@ -16,7 +16,7 @@ Displays shortcuts from the Windows Quick Launch folder as a compact icon grid �
 - Drag & drop icon reordering — order saved automatically
 - `Ctrl + Scroll` to resize icons on the fly
 - Fully customizable colors (background, icon background, hover, borders)
-- Portable — all settings saved to `settings.json` next to the EXE, no registry
+- Portable — all settings saved to `settings.json` next to the EXE, no registry - no elevated rights - no installation
 
 ## Requirements
 
