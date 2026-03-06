@@ -1,10 +1,13 @@
 # QuickLaunchBar
 
 A lightweight Quick Launch toolbar for Windows 11, built with Python and tkinter.
+<img width="27" height="30" alt="grafik" src="https://github.com/user-attachments/assets/1cdf1422-1cc9-4e31-9e82-7fbd99c3389e" />
+
 
 Displays shortcuts from the Windows Quick Launch folder as a compact icon grid — always on top, auto-hides on focus loss, lives in the system tray.
 
-<img width="698" height="298" alt="grafik" src="https://github.com/user-attachments/assets/0d40d61f-0200-4a98-b19b-5dc1aa32e3f1" />
+<img width="707" height="283" alt="grafik" src="https://github.com/user-attachments/assets/a4c2fde3-ebc9-4b98-b314-c6bdb74170ec" />
+
 
 
 
