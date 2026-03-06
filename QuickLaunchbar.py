@@ -1,5 +1,5 @@
 """
-QuickLaunchBar.py  –  v1.7
+QuickLaunchBar.py
 Displays all shortcuts from the Quick Launch folder as an icon bar.
 Requires: pip install pillow pywin32
 
@@ -10,6 +10,9 @@ Changes v1.4:  Ctrl+Scroll to resize icons; extended icon size list
 Changes v1.5:  Click app name in tray menu to open Quick Launch folder in Explorer
 Changes v1.6:  Tray context menu closes correctly when clicking outside
 Changes v1.7:  Background color configurable in Settings (Auto vs Manual with color picker)
+Changes v1.8:  Icon background: Auto (brightness offset %) or Manual (color picker)
+Changes v1.9:  Border color now visually distinct from button background
+Changes v2.0:  Hover color: Auto (derived) or Manual (color picker)
 """
 
 import os
@@ -29,7 +32,7 @@ import win32ui
 import win32con
 import win32api
 
-VERSION = "1.7"
+VERSION = "2.0"
 
 # ── Single Instance Guard ─────────────────────────────────────────────────────
 _MUTEX_NAME = "QuickLaunchBar_SingleInstance_Mutex"
@@ -57,6 +60,13 @@ DEFAULTS = {
     "OffsetX":     8,
     "OffsetY":     50,
     "Order":       [],
+    "BgColor":     "#000000",
+    "BtnStyle":    "auto",
+    "IconBgStyle":  "auto",
+    "IconBgOffset": 15,
+    "IconBgColor":  "#1c1c1c",
+    "HoverStyle":   "auto",
+    "HoverColor":   "#464646",
 }
 
 _settings: dict = {}
@@ -125,28 +135,55 @@ QUICK_LAUNCH = os.path.expandvars(
 
 PAD = 6
 
+def _get_hover_color() -> str:
+    """Berechnet die Hover-Farbe."""
+    if _settings.get("HoverStyle", "auto") == "manual":
+        return _settings.get("HoverColor", "#464646") or "#464646"
+    # Auto: BTN_NORM nochmal eine Stufe heller/dunkler
+    bg = (_settings.get("BgColor", "#000000") or "#000000").lstrip("#")
+    r, g, b = int(bg[0:2],16), int(bg[2:4],16), int(bg[4:6],16)
+    brightness = (r*299 + g*587 + b*114) // 1000
+    step = 30
+    if brightness < 128:
+        r, g, b = min(255,r+step*2), min(255,g+step*2), min(255,b+step*2)
+    else:
+        r, g, b = max(0,r-step*2), max(0,g-step*2), max(0,b-step*2)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def _get_icon_bg() -> str:
+    """Berechnet die Icon-Hintergrundfarbe aus Settings."""
+    style = _settings.get("IconBgStyle", "auto")
+    if style == "manual":
+        return _settings.get("IconBgColor", "#1c1c1c") or "#1c1c1c"
+    bg = (_settings.get("BgColor", "#000000") or "#000000").lstrip("#")
+    r, g, b = int(bg[0:2],16), int(bg[2:4],16), int(bg[4:6],16)
+    offset = int(_settings.get("IconBgOffset", 15))
+    brightness = (r*299 + g*587 + b*114) // 1000
+    step = int(255 * offset / 100)
+    if brightness < 128:
+        r, g, b = min(255,r+step), min(255,g+step), min(255,b+step)
+    else:
+        r, g, b = max(0,r-step), max(0,g-step), max(0,b-step)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
 def _get_bg() -> str:
     return _settings.get("BgColor", "#000000") or "#000000"
 
 def _derive_colors(bg_hex: str):
-    """Leitet BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER aus der Hintergrundfarbe ab."""
     h = (bg_hex or "#000000").lstrip("#")
     r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
     def clamp(v): return max(0, min(255, v))
     def to_hex(r,g,b): return f"#{clamp(r):02x}{clamp(g):02x}{clamp(b):02x}"
-    # Helligkeit bestimmen ob wir aufhellen oder abdunkeln sollen
     brightness = (r*299 + g*587 + b*114) // 1000
     step = 30 if brightness < 128 else -30
     return (
         to_hex(r+step,   g+step,   b+step),    # BTN_NORM
         to_hex(r+step*2, g+step*2, b+step*2),  # BTN_HOVER
         to_hex(r+step*3, g+step*3, b+step*3),  # BTN_PRESS
-        to_hex(r+step,   g+step,   b+step),    # BORDER
+        to_hex(r+step*2, g+step*2, b+step*2),  # BORDER
     )
 
-BG                              = _get_bg()
-BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = _derive_colors(BG)
-
+BG        = _get_bg()
 BTN_NORM  = "#2d2d2d"
 BTN_HOVER = "#464646"
 BTN_PRESS = "#5f5f5f"
@@ -178,8 +215,6 @@ def best_icon(path: str, icon_size: int = 32):
         if res and info.hIcon:
             hicon = info.hIcon
 
-            # 32-bit DIB Section mit Alpha-Kanal für echte Transparenz
-
             class BITMAPINFOHEADER(ctypes.Structure):
                 _fields_ = [
                     ("biSize",          ctypes.c_uint32),
@@ -196,49 +231,42 @@ def best_icon(path: str, icon_size: int = 32):
                 ]
 
             bih = BITMAPINFOHEADER()
-            bih.biSize        = ctypes.sizeof(BITMAPINFOHEADER)
-            bih.biWidth       = icon_size
-            bih.biHeight      = -icon_size   # negativ = top-down
-            bih.biPlanes      = 1
-            bih.biBitCount    = 32
-            bih.biCompression = 0   # BI_RGB
+            bih.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bih.biWidth = icon_size
+            bih.biHeight = -icon_size
+            bih.biPlanes = 1
+            bih.biBitCount = 32
+            bih.biCompression = 0
 
             hdc_screen = win32gui.GetDC(0)
             hdc        = win32ui.CreateDCFromHandle(hdc_screen)
             hdc_mem    = hdc.CreateCompatibleDC()
 
-            pbits      = ctypes.c_void_p()
+            pbits = ctypes.c_void_p()
             hbmp = ctypes.windll.gdi32.CreateDIBSection(
                 hdc_mem.GetSafeHdc(), ctypes.byref(bih), 0,
                 ctypes.byref(pbits), None, 0
             )
             old_bmp = ctypes.windll.gdi32.SelectObject(hdc_mem.GetSafeHdc(), hbmp)
-
-            # Hintergrund transparent (alle Bytes = 0 = schwarz+transparent)
-            ctypes.windll.gdi32.PatBlt(hdc_mem.GetSafeHdc(), 0, 0, icon_size, icon_size, 0x00000042)  # BLACKNESS
-
-            # Icon mit Alpha rendern
+            ctypes.windll.gdi32.PatBlt(hdc_mem.GetSafeHdc(), 0, 0, icon_size, icon_size, 0x00000042)
             win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon,
                                 icon_size, icon_size, 0, None, win32con.DI_NORMAL)
 
-            # Pixel direkt aus DIB-Speicher lesen
             buf = (ctypes.c_uint8 * (icon_size * icon_size * 4))()
             ctypes.memmove(buf, pbits, icon_size * icon_size * 4)
             icon_img = Image.frombuffer("RGBA", (icon_size, icon_size),
                                         bytes(buf), "raw", "BGRA", 0, 1).copy()
 
-            # Cleanup
             ctypes.windll.gdi32.SelectObject(hdc_mem.GetSafeHdc(), old_bmp)
             ctypes.windll.gdi32.DeleteObject(hbmp)
             win32gui.ReleaseDC(0, hdc_screen)
             win32gui.DestroyIcon(hicon)
 
-            # Transparente Pixel auf Hintergrundfarbe compositen
-            _hex = (BG or "#000000").lstrip("#")
+            icon_bg = _get_icon_bg()
+            _hex = icon_bg.lstrip("#")
             br, bg_, bb = int(_hex[0:2],16), int(_hex[2:4],16), int(_hex[4:6],16)
             bg_img = Image.new("RGBA", (icon_size, icon_size), (br, bg_, bb, 255))
-            bg_img.paste(icon_img, mask=icon_img.split()[3])   # Alpha als Maske
-
+            bg_img.paste(icon_img, mask=icon_img.split()[3])
             return bg_img.resize((icon_size, icon_size), Image.LANCZOS)
     except Exception as e:
         print(f"best_icon EXCEPTION '{path}': {e}")
@@ -430,8 +458,8 @@ class QuickLaunchBar:
         if cfg_get("BtnStyle") == "manual":
             BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = _derive_colors(BG)
         else:
-            # Auto: Button-Farben unabhängig von BgColor, klassisch dunkel
             BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = "#2d2d2d", "#464646", "#5f5f5f", "#4b4b4b"
+        BTN_HOVER = _get_hover_color()
         self._cols         = cfg_get("Columns")
         self._max_rows     = cfg_get("MaxRows")
         self._icon_size    = cfg_get("IconSize")
@@ -441,7 +469,6 @@ class QuickLaunchBar:
         self._offset_y     = cfg_get("OffsetY")
 
     def _apply_bg(self):
-        """Hintergrundfarbe auf alle Fenster-Elemente anwenden."""
         self.root.configure(bg=BG)
         for w in self.root.winfo_children():
             try: w.configure(bg=BG)
@@ -920,64 +947,182 @@ class QuickLaunchBar:
         var_oy = tk.IntVar(value=cfg_get("OffsetY"))
         spinbox(win, var_oy, 0, 500).grid(row=6, column=1, sticky="w", **pad)
 
-        # ── Background Color ──────────────────────────────────────────────
-        tk.Label(win, text="Background Color:", bg="#2d2d2d", fg="white",
+        rb_style = dict(bg="#2d2d2d", fg="white", selectcolor="#464646",
+                        activebackground="#2d2d2d", activeforeground="white",
+                        font=("Segoe UI", 9), cursor="hand2")
+
+        # ── Icon Background Color ─────────────────────────────────────────
+        tk.Label(win, text="Icon Background:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=7, column=0, sticky="w", **pad)
+
+        var_iconbg_style  = tk.StringVar(value=cfg_get("IconBgStyle")  or "auto")
+        var_iconbg_offset = tk.IntVar(value=int(cfg_get("IconBgOffset") or 15))
+        var_iconbg_color  = tk.StringVar(value=cfg_get("IconBgColor")  or "#1c1c1c")
+
+        iconbg_row = tk.Frame(win, bg="#2d2d2d")
+        iconbg_row.grid(row=7, column=1, columnspan=2, sticky="w", padx=12, pady=2)
+
+        iconbg_preview = tk.Frame(iconbg_row, width=22, height=16,
+                                  highlightthickness=1, highlightbackground="#666")
+
+        def _update_iconbg_preview(*_):
+            if var_iconbg_style.get() == "manual":
+                iconbg_preview.configure(bg=var_iconbg_color.get())
+            else:
+                bg = (cfg_get("BgColor") or "#000000").lstrip("#")
+                r2,g2,b2 = int(bg[0:2],16),int(bg[2:4],16),int(bg[4:6],16)
+                brightness = (r2*299+g2*587+b2*114)//1000
+                try: step = int(255 * var_iconbg_offset.get() / 100)
+                except: step = 38
+                if brightness < 128:
+                    r2,g2,b2 = min(255,r2+step),min(255,g2+step),min(255,b2+step)
+                else:
+                    r2,g2,b2 = max(0,r2-step),max(0,g2-step),max(0,b2-step)
+                iconbg_preview.configure(bg=f"#{r2:02x}{g2:02x}{b2:02x}")
+
+        def pick_iconbg():
+            from tkinter.colorchooser import askcolor
+            result = askcolor(color=var_iconbg_color.get(), parent=win, title="Icon Background Color")
+            if result[1]:
+                var_iconbg_color.set(result[1])
+                _update_iconbg_preview()
+
+        offset_spin = tk.Spinbox(iconbg_row, from_=0, to=100,
+                                 textvariable=var_iconbg_offset, width=4,
+                                 bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
+                                 insertbackground="white",
+                                 command=_update_iconbg_preview)
+        offset_spin.bind("<KeyRelease>", _update_iconbg_preview)
+
+        btn_iconbg_pick = tk.Button(iconbg_row, text="Pick...", command=pick_iconbg, width=6,
+                                    bg="#464646", fg="white", relief="flat",
+                                    activebackground="#5a5a5a", cursor="hand2")
+        pct_label = tk.Label(iconbg_row, text="%", bg="#2d2d2d", fg="#aaaaaa",
+                             font=("Segoe UI", 9))
+
+        def on_iconbg_style(*_):
+            is_manual = var_iconbg_style.get() == "manual"
+            offset_spin.configure(state="disabled" if is_manual else "normal")
+            pct_label.configure(fg="#555555" if is_manual else "#aaaaaa")
+            btn_iconbg_pick.configure(state="normal" if is_manual else "disabled")
+            _update_iconbg_preview()
+
+        tk.Radiobutton(iconbg_row, text="Auto", variable=var_iconbg_style,
+                       value="auto",   command=on_iconbg_style, **rb_style).pack(side="left")
+        offset_spin.pack(side="left", padx=(6,0))
+        pct_label.pack(side="left", padx=(2,8))
+        tk.Radiobutton(iconbg_row, text="Manual", variable=var_iconbg_style,
+                       value="manual", command=on_iconbg_style, **rb_style).pack(side="left", padx=(0,4))
+        iconbg_preview.pack(side="left", padx=(0,4))
+        btn_iconbg_pick.pack(side="left")
+        on_iconbg_style()
+
+        # ── Window Background Color ───────────────────────────────────────
+        tk.Label(win, text="Background Color:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=8, column=0, sticky="w", **pad)
 
         var_btn_style = tk.StringVar(value=cfg_get("BtnStyle") or "auto")
         var_bg        = tk.StringVar(value=cfg_get("BgColor") or "#000000")
 
         bg_row = tk.Frame(win, bg="#2d2d2d")
-        bg_row.grid(row=7, column=1, columnspan=2, sticky="w", padx=12, pady=2)
-
-        rb_style = dict(bg="#2d2d2d", fg="white", selectcolor="#464646",
-                        activebackground="#2d2d2d", activeforeground="white",
-                        font=("Segoe UI", 9), cursor="hand2")
+        bg_row.grid(row=8, column=1, columnspan=2, sticky="w", padx=12, pady=2)
 
         bg_preview = tk.Frame(bg_row, width=22, height=16, bg=var_bg.get(),
                               highlightthickness=1, highlightbackground="#666")
 
-        def pick_color():
+        def pick_bg():
             from tkinter.colorchooser import askcolor
-            result = askcolor(color=var_bg.get(), parent=win, title="Background Color")
+            result = askcolor(color=var_bg.get(), parent=win, title="Window Color")
             if result[1]:
                 var_bg.set(result[1])
                 bg_preview.configure(bg=result[1])
+                _update_iconbg_preview()
 
-        btn_pick = tk.Button(bg_row, text="Pick...", command=pick_color, width=6,
-                             bg="#464646", fg="white", relief="flat",
-                             activebackground="#5a5a5a", cursor="hand2")
+        btn_bg_pick = tk.Button(bg_row, text="Pick...", command=pick_bg, width=6,
+                                bg="#464646", fg="white", relief="flat",
+                                activebackground="#5a5a5a", cursor="hand2")
 
-        def on_style_change(*_):
-            is_manual = var_btn_style.get() == "manual"
-            state = "normal" if is_manual else "disabled"
-            btn_pick.configure(state=state)
-            bg_preview.configure(bg=var_bg.get() if is_manual else "#555555")
+        def on_btnstyle(*_):
+            pass  # Auto/Manual für Button-Farben – future use
 
-        tk.Radiobutton(bg_row, text="Auto", variable=var_btn_style,
-                       value="auto",   command=on_style_change, **rb_style).pack(side="left")
-        tk.Radiobutton(bg_row, text="Manual", variable=var_btn_style,
-                       value="manual", command=on_style_change, **rb_style).pack(side="left", padx=(8,4))
         bg_preview.pack(side="left", padx=(0,4))
-        btn_pick.pack(side="left")
+        btn_bg_pick.pack(side="left")
 
-        on_style_change()  # initialer Zustand
+        # ── Hover Color ───────────────────────────────────────────────────
+        tk.Label(win, text="Hover Color:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=9, column=0, sticky="w", **pad)
+
+        var_hover_style = tk.StringVar(value=cfg_get("HoverStyle") or "auto")
+        var_hover_color = tk.StringVar(value=cfg_get("HoverColor") or "#464646")
+
+        hover_row = tk.Frame(win, bg="#2d2d2d")
+        hover_row.grid(row=9, column=1, columnspan=2, sticky="w", padx=12, pady=2)
+
+        hover_preview = tk.Frame(hover_row, width=22, height=16,
+                                 highlightthickness=1, highlightbackground="#666")
+
+        def _update_hover_preview(*_):
+            if var_hover_style.get() == "manual":
+                hover_preview.configure(bg=var_hover_color.get())
+            else:
+                bg = (cfg_get("BgColor") or "#000000").lstrip("#")
+                r2,g2,b2 = int(bg[0:2],16),int(bg[2:4],16),int(bg[4:6],16)
+                brightness = (r2*299+g2*587+b2*114)//1000
+                step = 30
+                if brightness < 128:
+                    r2,g2,b2 = min(255,r2+step*2),min(255,g2+step*2),min(255,b2+step*2)
+                else:
+                    r2,g2,b2 = max(0,r2-step*2),max(0,g2-step*2),max(0,b2-step*2)
+                hover_preview.configure(bg=f"#{r2:02x}{g2:02x}{b2:02x}")
+
+        def pick_hover():
+            from tkinter.colorchooser import askcolor
+            result = askcolor(color=var_hover_color.get(), parent=win, title="Hover Color")
+            if result[1]:
+                var_hover_color.set(result[1])
+                _update_hover_preview()
+
+        btn_hover_pick = tk.Button(hover_row, text="Pick...", command=pick_hover, width=6,
+                                   bg="#464646", fg="white", relief="flat",
+                                   activebackground="#5a5a5a", cursor="hand2")
+
+        rb_hover = dict(bg="#2d2d2d", fg="white", selectcolor="#464646",
+                        activebackground="#2d2d2d", activeforeground="white",
+                        font=("Segoe UI", 9), cursor="hand2")
+
+        def on_hover_style(*_):
+            is_manual = var_hover_style.get() == "manual"
+            btn_hover_pick.configure(state="normal" if is_manual else "disabled")
+            _update_hover_preview()
+
+        tk.Radiobutton(hover_row, text="Auto", variable=var_hover_style,
+                       value="auto",   command=on_hover_style, **rb_hover).pack(side="left")
+        tk.Radiobutton(hover_row, text="Manual", variable=var_hover_style,
+                       value="manual", command=on_hover_style, **rb_hover).pack(side="left", padx=(8,4))
+        hover_preview.pack(side="left", padx=(0,4))
+        btn_hover_pick.pack(side="left")
+        on_hover_style()
+        _update_hover_preview()
 
         tk.Label(win, text="⚠ If columns/rows are too small,\n   not all shortcuts may be shown.",
                  bg="#2d2d2d", fg="#aaaaaa",
                  font=("Segoe UI", 8), justify="left").grid(
-                 row=8, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
+                 row=10, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
 
         def on_ok():
-            cfg_set("Columns",     var_cols.get())
-            cfg_set("MaxRows",     var_rows.get())
-            cfg_set("IconSize",    int(var_icon.get()))
-            cfg_set("IconSpacing", var_spacing.get())
-            cfg_set("TaskbarPos",  tb_options[var_pos_label.get()])
-            cfg_set("OffsetX",     var_ox.get())
-            cfg_set("OffsetY",     var_oy.get())
-            cfg_set("BtnStyle",    var_btn_style.get())
-            cfg_set("BgColor",     var_bg.get())
+            cfg_set("Columns",      var_cols.get())
+            cfg_set("MaxRows",      var_rows.get())
+            cfg_set("IconSize",     int(var_icon.get()))
+            cfg_set("IconSpacing",  var_spacing.get())
+            cfg_set("TaskbarPos",   tb_options[var_pos_label.get()])
+            cfg_set("OffsetX",      var_ox.get())
+            cfg_set("OffsetY",      var_oy.get())
+            cfg_set("IconBgStyle",  var_iconbg_style.get())
+            cfg_set("IconBgOffset", var_iconbg_offset.get())
+            cfg_set("IconBgColor",  var_iconbg_color.get())
+            cfg_set("HoverStyle",   var_hover_style.get())
+            cfg_set("HoverColor",   var_hover_color.get())
+            cfg_set("BgColor",      var_bg.get())
             self._reload_cfg()
             self._apply_bg()
             self._load_shortcuts()
@@ -986,7 +1131,7 @@ class QuickLaunchBar:
         tk.Button(win, text="OK", command=on_ok, width=8,
                   bg="#464646", fg="white", relief="flat",
                   activebackground="#5a5a5a",
-                  cursor="hand2").grid(row=9, column=0, columnspan=3, pady=8)
+                  cursor="hand2").grid(row=11, column=0, columnspan=3, pady=8)
 
     # ── Quit ──────────────────────────────────────────────────────────────────
 

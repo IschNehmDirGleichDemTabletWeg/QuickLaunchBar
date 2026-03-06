@@ -43,6 +43,11 @@
     "Mp3tag.exe - Shortcut.lnk",
     "KI.lnk"
   ],
-  "BgColor": "#83e7c9",
-  "BtnStyle": "manual"
+  "BgColor": "#000000",
+  "BtnStyle": "manual",
+  "IconBgStyle": "manual",
+  "IconBgOffset": 15,
+  "IconBgColor": "#4a4035",
+  "HoverStyle": "manual",
+  "HoverColor": "#80ff00"
 }
