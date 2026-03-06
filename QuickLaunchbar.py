@@ -1,37 +1,15 @@
 """
-QuickLaunchBar.py  –  v1.6
+QuickLaunchBar.py  –  v1.7
 Displays all shortcuts from the Quick Launch folder as an icon bar.
 Requires: pip install pillow pywin32
 
-Changes v1.1:
-  - Settings are no longer stored in the registry,
-    but in a settings.json next to the EXE (portable, no installer needed)
-  - Migration: existing registry values are automatically imported on first run
-
-Changes v1.2:
-  - Window starts hidden – only the tray icon is visible on startup
-  - Tray icon is properly removed on exit (no ghost icon)
-
-Changes v1.3:
-  - Icons can be manually reordered via drag & drop
-  - Blue indicator shows the target position while dragging
-  - Semi-transparent ghost image follows the mouse
-  - Order is automatically saved in settings.json
-  - Click vs. drag is distinguished by a 5px threshold
-
-Changes v1.4:
-  - Ctrl + Mouse Wheel to dynamically change icon size
-  - Ctrl + Right-click on empty area opens Explorer in the Quick Launch folder
-  - Extended icon size list: 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48
-
-Changes v1.5:
-  - Clicking the app name in the tray menu opens the Quick Launch folder in Explorer
-  - Tray icon tooltip shows a hint about this feature
-
-Changes v1.6:
-  - Tray context menu now auto-hides the icon bar when dismissed
-
-
+Changes v1.1:  Settings moved from registry to portable settings.json
+Changes v1.2:  Window starts hidden on startup; tray icon removed cleanly on exit
+Changes v1.3:  Drag & drop icon reordering with ghost image and blue drop indicator
+Changes v1.4:  Ctrl+Scroll to resize icons; extended icon size list
+Changes v1.5:  Click app name in tray menu to open Quick Launch folder in Explorer
+Changes v1.6:  Tray context menu closes correctly when clicking outside
+Changes v1.7:  Background color configurable in Settings (Auto vs Manual with color picker)
 """
 
 import os
@@ -40,6 +18,7 @@ import json
 import threading
 import subprocess
 import ctypes
+import ctypes.wintypes
 import tkinter as tk
 import tkinter.messagebox
 import tkinter.ttk as ttk
@@ -50,7 +29,7 @@ import win32ui
 import win32con
 import win32api
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 # ── Single Instance Guard ─────────────────────────────────────────────────────
 _MUTEX_NAME = "QuickLaunchBar_SingleInstance_Mutex"
@@ -144,8 +123,30 @@ QUICK_LAUNCH = os.path.expandvars(
     r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch"
 )
 
-PAD       = 6
-BG        = "#1c1c1c"
+PAD = 6
+
+def _get_bg() -> str:
+    return _settings.get("BgColor", "#000000") or "#000000"
+
+def _derive_colors(bg_hex: str):
+    """Leitet BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER aus der Hintergrundfarbe ab."""
+    h = (bg_hex or "#000000").lstrip("#")
+    r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    def clamp(v): return max(0, min(255, v))
+    def to_hex(r,g,b): return f"#{clamp(r):02x}{clamp(g):02x}{clamp(b):02x}"
+    # Helligkeit bestimmen ob wir aufhellen oder abdunkeln sollen
+    brightness = (r*299 + g*587 + b*114) // 1000
+    step = 30 if brightness < 128 else -30
+    return (
+        to_hex(r+step,   g+step,   b+step),    # BTN_NORM
+        to_hex(r+step*2, g+step*2, b+step*2),  # BTN_HOVER
+        to_hex(r+step*3, g+step*3, b+step*3),  # BTN_PRESS
+        to_hex(r+step,   g+step,   b+step),    # BORDER
+    )
+
+BG                              = _get_bg()
+BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = _derive_colors(BG)
+
 BTN_NORM  = "#2d2d2d"
 BTN_HOVER = "#464646"
 BTN_PRESS = "#5f5f5f"
@@ -158,14 +159,13 @@ DRAG_THRESHOLD = 5      # px bis Drag startet
 
 def best_icon(path: str, icon_size: int = 32):
     try:
-        from ctypes import wintypes
         shell32 = ctypes.windll.shell32
 
         class SHFILEINFO(ctypes.Structure):
             _fields_ = [
-                ("hIcon",         wintypes.HANDLE),
+                ("hIcon",         ctypes.wintypes.HANDLE),
                 ("iIcon",         ctypes.c_int),
-                ("dwAttributes",  wintypes.DWORD),
+                ("dwAttributes",  ctypes.wintypes.DWORD),
                 ("szDisplayName", ctypes.c_wchar * 260),
                 ("szTypeName",    ctypes.c_wchar * 80),
             ]
@@ -176,26 +176,70 @@ def best_icon(path: str, icon_size: int = 32):
             0x000000100 | 0x000000000   # SHGFI_ICON | SHGFI_LARGEICON
         )
         if res and info.hIcon:
-            hicon      = info.hIcon
+            hicon = info.hIcon
+
+            # 32-bit DIB Section mit Alpha-Kanal für echte Transparenz
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize",          ctypes.c_uint32),
+                    ("biWidth",         ctypes.c_int32),
+                    ("biHeight",        ctypes.c_int32),
+                    ("biPlanes",        ctypes.c_uint16),
+                    ("biBitCount",      ctypes.c_uint16),
+                    ("biCompression",   ctypes.c_uint32),
+                    ("biSizeImage",     ctypes.c_uint32),
+                    ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32),
+                    ("biClrUsed",       ctypes.c_uint32),
+                    ("biClrImportant",  ctypes.c_uint32),
+                ]
+
+            bih = BITMAPINFOHEADER()
+            bih.biSize        = ctypes.sizeof(BITMAPINFOHEADER)
+            bih.biWidth       = icon_size
+            bih.biHeight      = -icon_size   # negativ = top-down
+            bih.biPlanes      = 1
+            bih.biBitCount    = 32
+            bih.biCompression = 0   # BI_RGB
+
             hdc_screen = win32gui.GetDC(0)
             hdc        = win32ui.CreateDCFromHandle(hdc_screen)
             hdc_mem    = hdc.CreateCompatibleDC()
-            hbmp       = win32ui.CreateBitmap()
-            hbmp.CreateCompatibleBitmap(hdc, icon_size, icon_size)
-            hdc_mem.SelectObject(hbmp)
-            hdc_mem.FillSolidRect((0, 0, icon_size, icon_size), 0x1c1c1c)
+
+            pbits      = ctypes.c_void_p()
+            hbmp = ctypes.windll.gdi32.CreateDIBSection(
+                hdc_mem.GetSafeHdc(), ctypes.byref(bih), 0,
+                ctypes.byref(pbits), None, 0
+            )
+            old_bmp = ctypes.windll.gdi32.SelectObject(hdc_mem.GetSafeHdc(), hbmp)
+
+            # Hintergrund transparent (alle Bytes = 0 = schwarz+transparent)
+            ctypes.windll.gdi32.PatBlt(hdc_mem.GetSafeHdc(), 0, 0, icon_size, icon_size, 0x00000042)  # BLACKNESS
+
+            # Icon mit Alpha rendern
             win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon,
                                 icon_size, icon_size, 0, None, win32con.DI_NORMAL)
-            bmpinfo = hbmp.GetInfo()
-            bmpdata = hbmp.GetBitmapBits(True)
-            img = Image.frombuffer(
-                "RGBA",
-                (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-                bmpdata, "raw", "BGRA", 0, 1
-            )
+
+            # Pixel direkt aus DIB-Speicher lesen
+            buf = (ctypes.c_uint8 * (icon_size * icon_size * 4))()
+            ctypes.memmove(buf, pbits, icon_size * icon_size * 4)
+            icon_img = Image.frombuffer("RGBA", (icon_size, icon_size),
+                                        bytes(buf), "raw", "BGRA", 0, 1).copy()
+
+            # Cleanup
+            ctypes.windll.gdi32.SelectObject(hdc_mem.GetSafeHdc(), old_bmp)
+            ctypes.windll.gdi32.DeleteObject(hbmp)
             win32gui.ReleaseDC(0, hdc_screen)
             win32gui.DestroyIcon(hicon)
-            return img.resize((icon_size, icon_size), Image.LANCZOS)
+
+            # Transparente Pixel auf Hintergrundfarbe compositen
+            _hex = (BG or "#000000").lstrip("#")
+            br, bg_, bb = int(_hex[0:2],16), int(_hex[2:4],16), int(_hex[4:6],16)
+            bg_img = Image.new("RGBA", (icon_size, icon_size), (br, bg_, bb, 255))
+            bg_img.paste(icon_img, mask=icon_img.split()[3])   # Alpha als Maske
+
+            return bg_img.resize((icon_size, icon_size), Image.LANCZOS)
     except Exception as e:
         print(f"best_icon EXCEPTION '{path}': {e}")
     return None
@@ -373,6 +417,7 @@ class QuickLaunchBar:
         self._filenames   = []     # parallel zu _buttons: Dateinamen
 
         self._reload_cfg()
+        self._apply_bg()
         self._images = {}
         self._load_shortcuts()
         self._position_window()
@@ -380,6 +425,13 @@ class QuickLaunchBar:
         self._setup_tray()
 
     def _reload_cfg(self):
+        global BG, BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER
+        BG = _get_bg()
+        if cfg_get("BtnStyle") == "manual":
+            BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = _derive_colors(BG)
+        else:
+            # Auto: Button-Farben unabhängig von BgColor, klassisch dunkel
+            BTN_NORM, BTN_HOVER, BTN_PRESS, BORDER = "#2d2d2d", "#464646", "#5f5f5f", "#4b4b4b"
         self._cols         = cfg_get("Columns")
         self._max_rows     = cfg_get("MaxRows")
         self._icon_size    = cfg_get("IconSize")
@@ -387,6 +439,19 @@ class QuickLaunchBar:
         self._tb_pos       = cfg_get("TaskbarPos")
         self._offset_x     = cfg_get("OffsetX")
         self._offset_y     = cfg_get("OffsetY")
+
+    def _apply_bg(self):
+        """Hintergrundfarbe auf alle Fenster-Elemente anwenden."""
+        self.root.configure(bg=BG)
+        for w in self.root.winfo_children():
+            try: w.configure(bg=BG)
+            except: pass
+            for ww in w.winfo_children():
+                try: ww.configure(bg=BG)
+                except: pass
+                for www in ww.winfo_children():
+                    try: www.configure(bg=BG)
+                    except: pass
 
     # ── Position & Window-Drag ────────────────────────────────────────────────
 
@@ -855,10 +920,53 @@ class QuickLaunchBar:
         var_oy = tk.IntVar(value=cfg_get("OffsetY"))
         spinbox(win, var_oy, 0, 500).grid(row=6, column=1, sticky="w", **pad)
 
+        # ── Background Color ──────────────────────────────────────────────
+        tk.Label(win, text="Background Color:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=7, column=0, sticky="w", **pad)
+
+        var_btn_style = tk.StringVar(value=cfg_get("BtnStyle") or "auto")
+        var_bg        = tk.StringVar(value=cfg_get("BgColor") or "#000000")
+
+        bg_row = tk.Frame(win, bg="#2d2d2d")
+        bg_row.grid(row=7, column=1, columnspan=2, sticky="w", padx=12, pady=2)
+
+        rb_style = dict(bg="#2d2d2d", fg="white", selectcolor="#464646",
+                        activebackground="#2d2d2d", activeforeground="white",
+                        font=("Segoe UI", 9), cursor="hand2")
+
+        bg_preview = tk.Frame(bg_row, width=22, height=16, bg=var_bg.get(),
+                              highlightthickness=1, highlightbackground="#666")
+
+        def pick_color():
+            from tkinter.colorchooser import askcolor
+            result = askcolor(color=var_bg.get(), parent=win, title="Background Color")
+            if result[1]:
+                var_bg.set(result[1])
+                bg_preview.configure(bg=result[1])
+
+        btn_pick = tk.Button(bg_row, text="Pick...", command=pick_color, width=6,
+                             bg="#464646", fg="white", relief="flat",
+                             activebackground="#5a5a5a", cursor="hand2")
+
+        def on_style_change(*_):
+            is_manual = var_btn_style.get() == "manual"
+            state = "normal" if is_manual else "disabled"
+            btn_pick.configure(state=state)
+            bg_preview.configure(bg=var_bg.get() if is_manual else "#555555")
+
+        tk.Radiobutton(bg_row, text="Auto", variable=var_btn_style,
+                       value="auto",   command=on_style_change, **rb_style).pack(side="left")
+        tk.Radiobutton(bg_row, text="Manual", variable=var_btn_style,
+                       value="manual", command=on_style_change, **rb_style).pack(side="left", padx=(8,4))
+        bg_preview.pack(side="left", padx=(0,4))
+        btn_pick.pack(side="left")
+
+        on_style_change()  # initialer Zustand
+
         tk.Label(win, text="⚠ If columns/rows are too small,\n   not all shortcuts may be shown.",
                  bg="#2d2d2d", fg="#aaaaaa",
                  font=("Segoe UI", 8), justify="left").grid(
-                 row=7, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
+                 row=8, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
 
         def on_ok():
             cfg_set("Columns",     var_cols.get())
@@ -868,14 +976,17 @@ class QuickLaunchBar:
             cfg_set("TaskbarPos",  tb_options[var_pos_label.get()])
             cfg_set("OffsetX",     var_ox.get())
             cfg_set("OffsetY",     var_oy.get())
+            cfg_set("BtnStyle",    var_btn_style.get())
+            cfg_set("BgColor",     var_bg.get())
             self._reload_cfg()
+            self._apply_bg()
             self._load_shortcuts()
             win.destroy()
 
         tk.Button(win, text="OK", command=on_ok, width=8,
                   bg="#464646", fg="white", relief="flat",
                   activebackground="#5a5a5a",
-                  cursor="hand2").grid(row=8, column=0, columnspan=3, pady=8)
+                  cursor="hand2").grid(row=9, column=0, columnspan=3, pady=8)
 
     # ── Quit ──────────────────────────────────────────────────────────────────
 
