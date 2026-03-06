@@ -9,8 +9,10 @@ import sys
 import threading
 import subprocess
 import winreg
+import ctypes
 import tkinter as tk
 import tkinter.messagebox
+import tkinter.ttk as ttk
 from PIL import Image, ImageTk
 import win32com.client
 import win32gui
@@ -19,6 +21,14 @@ import win32con
 import win32api
 
 VERSION = "1.0"
+
+# ── Single Instance Guard ─────────────────────────────────────────────────────
+_MUTEX_NAME = "QuickLaunchBar_SingleInstance_Mutex"
+_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    # Bereits eine Instanz aktiv → diese sofort beenden
+    ctypes.windll.kernel32.CloseHandle(_mutex)
+    sys.exit(0)
 
 REG_KEY = r"Software\QuickLaunchBar"
 
@@ -330,10 +340,13 @@ class QuickLaunchBar:
 
         self._btn_frame = tk.Frame(inner, bg=BG)
         self._btn_frame.pack()
-        self._cols      = reg_get("Columns", 8)
-        self._max_rows  = reg_get("MaxRows", 0)
-        self._icon_size = reg_get("IconSize", 32)
-        self._tb_pos    = reg_get("TaskbarPos", "bottom")  # bottom/top/left/right
+        self._cols         = reg_get("Columns", 8)
+        self._max_rows     = reg_get("MaxRows", 0)
+        self._icon_size    = reg_get("IconSize", 32)
+        self._icon_spacing = reg_get("IconSpacing", 2)
+        self._tb_pos       = reg_get("TaskbarPos", "bottom-right")
+        self._offset_x     = reg_get("OffsetX", 8)
+        self._offset_y     = reg_get("OffsetY", 50)
 
         self._images  = {}  # key=filename, value=ImageTk – niemals löschen (GC-Schutz)
         self._load_shortcuts()
@@ -360,23 +373,21 @@ class QuickLaunchBar:
             mw = self.root.winfo_screenwidth()
             mh = self.root.winfo_screenheight()
 
-        GAP = 8
+        ox = self._offset_x
+        oy = self._offset_y
         pos = self._tb_pos
-        if pos == "bottom":
-            x = mx0 + mw - w - GAP
-            y = my0 + mh - h - 50
-        elif pos == "top":
-            x = mx0 + mw - w - GAP
-            y = my0 + 50
-        elif pos == "left":
-            x = mx0 + 50
-            y = my0 + mh - h - GAP
-        elif pos == "right":
-            x = mx0 + mw - w - 50
-            y = my0 + mh - h - GAP
-        else:
-            x = mx0 + mw - w - GAP
-            y = my0 + mh - h - 50
+        if pos == "top-left":
+            x = mx0 + ox
+            y = my0 + oy
+        elif pos == "top-right":
+            x = mx0 + mw - w - ox
+            y = my0 + oy
+        elif pos == "bottom-left":
+            x = mx0 + ox
+            y = my0 + mh - h - oy
+        else:  # bottom-right (default)
+            x = mx0 + mw - w - ox
+            y = my0 + mh - h - oy
 
         self.root.geometry(f"+{x}+{y}")
 
@@ -406,7 +417,7 @@ class QuickLaunchBar:
 
         if not os.path.exists(QUICK_LAUNCH):
             tk.Label(self._btn_frame,
-                     text="Quick Launch\nnicht gefunden",
+                     text="Quick Launch\nfolder not found",
                      bg=BG, fg="#aaaaaa").pack()
             return
 
@@ -437,38 +448,39 @@ class QuickLaunchBar:
                 on_click       = lambda p=lnk: self._launch(p),
                 on_right_click = lambda e, p=lnk, n=name: self._ctx(e, p, n),
             )
-            btn.grid(row=row, column=col % self._cols, padx=2, pady=2)
+            sp = self._icon_spacing
+            btn.grid(row=row, column=col % self._cols, padx=sp, pady=sp)
 
     def _launch(self, lnk_path):
         try:
             os.startfile(lnk_path)
             self.root.withdraw()
         except Exception as ex:
-            tkinter.messagebox.showerror("Fehler", str(ex))
+            tkinter.messagebox.showerror("Error", str(ex))
 
     def _ctx(self, event, lnk_path, name):
         menu = tk.Menu(self.root, tearoff=0,
                        bg="#2d2d2d", fg="white",
                        activebackground="#464646",
                        activeforeground="white")
-        menu.add_command(label="Öffnen",
+        menu.add_command(label="Open",
                          command=lambda: self._launch(lnk_path))
-        menu.add_command(label="Im Explorer zeigen",
+        menu.add_command(label="Show in Explorer",
                          command=lambda: subprocess.Popen(
                              f'explorer /select,"{lnk_path}"'))
         menu.add_separator()
-        menu.add_command(label="Entfernen",
+        menu.add_command(label="Remove",
                          command=lambda: self._remove(lnk_path, name))
         menu.tk_popup(event.x_root, event.y_root)
 
     def _remove(self, lnk_path, name):
         if tkinter.messagebox.askyesno(
-                "Quick Launch", f"'{name}' löschen?"):
+                "Quick Launch Bar", f"Delete '{name}' from Quick Launch?"):
             try:
                 os.remove(lnk_path)
                 self._load_shortcuts()
             except Exception as ex:
-                tkinter.messagebox.showerror("Fehler", str(ex))
+                tkinter.messagebox.showerror("Error", str(ex))
 
     # ── Tray ──────────────────────────────────────────────────────────────────
 
@@ -503,17 +515,40 @@ class QuickLaunchBar:
         hwnd  = win32gui.CreateWindow(cls, "Tray", 0, 0, 0, 0, 0,
                                       0, 0, wc.hInstance, None)
         exe = sys.executable if getattr(sys, "frozen", False) else __file__
-        try:
-            hicon = win32gui.LoadImage(
-                0,
-                exe,
-                win32con.IMAGE_ICON,
-                16, 16,
-                win32con.LR_LOADFROMFILE
-            )
-        except Exception as ex:
-            import ctypes
-            # Fallback: ExtractIconEx direkt
+
+        # Bei --onefile liegt die ICO im entpackten temp-Ordner (_MEIPASS)
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(exe)))
+        ico_path = os.path.join(base_dir, "quicklaunch.ico")
+
+        hicon = None
+
+        # Versuch 1: ICO aus _MEIPASS oder Skript-Ordner laden
+        if os.path.exists(ico_path):
+            try:
+                hicon = win32gui.LoadImage(
+                    0, ico_path,
+                    win32con.IMAGE_ICON,
+                    16, 16,
+                    win32con.LR_LOADFROMFILE
+                )
+            except Exception:
+                hicon = None
+
+        # Versuch 2: Icon aus EXE-Ressource (funktioniert bei --onedir)
+        if not hicon:
+            try:
+                hicon = win32gui.LoadImage(
+                    win32api.GetModuleHandle(None),
+                    1,
+                    win32con.IMAGE_ICON,
+                    16, 16,
+                    win32con.LR_DEFAULTCOLOR
+                )
+            except Exception:
+                hicon = None
+
+        # Versuch 3: ExtractIconEx aus der EXE
+        if not hicon:
             try:
                 large, small = win32gui.ExtractIconEx(exe, 0)
                 hicon = small[0] if small else (large[0] if large else None)
@@ -522,8 +557,10 @@ class QuickLaunchBar:
                     except: pass
             except Exception:
                 hicon = None
-            if not hicon:
-                hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+
+        # Fallback: Windows-Standard-Icon
+        if not hicon:
+            hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
         win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, (
             hwnd, TRAY_ID,
             win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
@@ -544,16 +581,16 @@ class QuickLaunchBar:
                        activeforeground="white")
         menu.add_command(label=f"Quick Launch Bar v{VERSION}", state="disabled")
         menu.add_separator()
-        menu.add_command(label="Neu laden",  command=self._load_shortcuts)
-        menu.add_command(label="Einstellungen...", command=self._show_settings)
+        menu.add_command(label="Reload",    command=self._load_shortcuts)
+        menu.add_command(label="Settings...", command=self._show_settings)
         menu.add_separator()
-        menu.add_command(label="Beenden",    command=self.root.quit)
+        menu.add_command(label="Exit",      command=self.root.quit)
         menu.tk_popup(self.root.winfo_pointerx(),
                       self.root.winfo_pointery())
 
     def _show_settings(self):
         win = tk.Toplevel(self.root)
-        win.title("Einstellungen")
+        win.title("Settings")
         win.configure(bg="#2d2d2d")
         win.resizable(False, False)
         win.attributes("-topmost", True)
@@ -561,59 +598,101 @@ class QuickLaunchBar:
         win.update_idletasks()
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        w, h = 300, 220
+        w, h = 340, 300
         win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-        pad = dict(padx=12, pady=5)
+        # pady halbiert: von 5 auf 2
+        pad = dict(padx=12, pady=2)
 
-        tk.Label(win, text="Spalten:", bg="#2d2d2d", fg="white",
+        def spinbox(parent, var, from_, to):
+            return tk.Spinbox(parent, from_=from_, to=to, textvariable=var, width=6,
+                              bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
+                              insertbackground="white")
+
+        # Row 0 – Columns
+        tk.Label(win, text="Columns:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", **pad)
         var_cols = tk.IntVar(value=reg_get("Columns", 8))
-        tk.Spinbox(win, from_=1, to=20, textvariable=var_cols, width=6,
-                   bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
-                   insertbackground="white").grid(row=0, column=1, sticky="w", **pad)
+        spinbox(win, var_cols, 1, 20).grid(row=0, column=1, sticky="w", **pad)
 
-        tk.Label(win, text="Zeilen (max):", bg="#2d2d2d", fg="white",
+        # Row 1 – Max Rows
+        tk.Label(win, text="Max Rows:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", **pad)
         var_rows = tk.IntVar(value=reg_get("MaxRows", 0))
-        tk.Spinbox(win, from_=0, to=20, textvariable=var_rows, width=6,
-                   bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
-                   insertbackground="white").grid(row=1, column=1, sticky="w", **pad)
+        spinbox(win, var_rows, 0, 20).grid(row=1, column=1, sticky="w", **pad)
         tk.Label(win, text="(0 = auto)", bg="#2d2d2d", fg="#888888",
                  font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w")
 
-        tk.Label(win, text="Icon-Größe:", bg="#2d2d2d", fg="white",
+        # Row 2 – Icon Size
+        tk.Label(win, text="Icon Size:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", **pad)
-        var_icon = tk.IntVar(value=reg_get("IconSize", 32))
-        tk.OptionMenu(win, var_icon, 16, 24, 32, 48).grid(row=2, column=1, sticky="w", **pad)
+        var_icon = tk.StringVar(value=str(reg_get("IconSize", 32)))
+        ttk.Combobox(win, textvariable=var_icon,
+                     values=["8", "12", "16", "20", "24", "28", "32", "48"],
+                     width=6, state="readonly").grid(row=2, column=1, sticky="w", **pad)
 
-        tk.Label(win, text="Taskleiste:", bg="#2d2d2d", fg="white",
+        # Row 3 – Icon Spacing
+        tk.Label(win, text="Icon Spacing (px):", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=3, column=0, sticky="w", **pad)
-        var_pos = tk.StringVar(value=reg_get("TaskbarPos", "bottom"))
-        tb_options = {"Unten": "bottom", "Oben": "top",
-                      "Links": "left",   "Rechts": "right"}
-        # Reverse lookup für Anzeige
-        pos_display = {v: k for k, v in tb_options.items()}
-        var_pos_label = tk.StringVar(value=pos_display.get(var_pos.get(), "Unten"))
-        om = tk.OptionMenu(win, var_pos_label, *tb_options.keys())
-        om.grid(row=3, column=1, sticky="w", **pad)
+        var_spacing = tk.IntVar(value=reg_get("IconSpacing", 2))
+        spinbox(win, var_spacing, 0, 20).grid(row=3, column=1, sticky="w", **pad)
+
+        # Row 4 – Taskbar Position (width=12 → Dropdown breit genug)
+        tk.Label(win, text="Taskbar Position:", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=4, column=0, sticky="w", **pad)
+        tb_options = {
+            "Top Left":     "top-left",
+            "Top Right":    "top-right",
+            "Bottom Left":  "bottom-left",
+            "Bottom Right": "bottom-right",
+        }
+        pos_display   = {v: k for k, v in tb_options.items()}
+        var_pos_label = tk.StringVar(value=pos_display.get(reg_get("TaskbarPos", "bottom-right"), "Bottom Right"))
+        ttk.Combobox(win, textvariable=var_pos_label,
+                     values=list(tb_options.keys()),
+                     width=12, state="readonly").grid(row=4, column=1, columnspan=2,
+                                                      sticky="w", **pad)
+
+        # Row 5 – Offset X
+        tk.Label(win, text="Offset X (px):", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=5, column=0, sticky="w", **pad)
+        var_ox = tk.IntVar(value=reg_get("OffsetX", 8))
+        spinbox(win, var_ox, 0, 500).grid(row=5, column=1, sticky="w", **pad)
+
+        # Row 6 – Offset Y
+        tk.Label(win, text="Offset Y (px):", bg="#2d2d2d", fg="white",
+                 font=("Segoe UI", 9)).grid(row=6, column=0, sticky="w", **pad)
+        var_oy = tk.IntVar(value=reg_get("OffsetY", 50))
+        spinbox(win, var_oy, 0, 500).grid(row=6, column=1, sticky="w", **pad)
+
+        # Row 7 – Hinweis
+        tk.Label(win, text="⚠ If columns/rows are too small,\n   not all shortcuts may be shown.",
+                 bg="#2d2d2d", fg="#aaaaaa",
+                 font=("Segoe UI", 8), justify="left").grid(
+                 row=7, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
 
         def on_ok():
-            reg_set("Columns",    var_cols.get())
-            reg_set("MaxRows",    var_rows.get())
-            reg_set("IconSize",   var_icon.get())
-            reg_set("TaskbarPos", tb_options[var_pos_label.get()])
-            self._cols      = var_cols.get()
-            self._max_rows  = var_rows.get()
-            self._icon_size = var_icon.get()
-            self._tb_pos    = tb_options[var_pos_label.get()]
+            reg_set("Columns",     var_cols.get())
+            reg_set("MaxRows",     var_rows.get())
+            reg_set("IconSize",    int(var_icon.get()))
+            reg_set("IconSpacing", var_spacing.get())
+            reg_set("TaskbarPos",  tb_options[var_pos_label.get()])
+            reg_set("OffsetX",     var_ox.get())
+            reg_set("OffsetY",     var_oy.get())
+            self._cols         = var_cols.get()
+            self._max_rows     = var_rows.get()
+            self._icon_size    = int(var_icon.get())
+            self._icon_spacing = var_spacing.get()
+            self._tb_pos       = tb_options[var_pos_label.get()]
+            self._offset_x     = var_ox.get()
+            self._offset_y     = var_oy.get()
             self._load_shortcuts()
             win.destroy()
 
         tk.Button(win, text="OK", command=on_ok, width=8,
                   bg="#464646", fg="white", relief="flat",
                   activebackground="#5a5a5a",
-                  cursor="hand2").grid(row=4, column=0, columnspan=3, pady=12)
+                  cursor="hand2").grid(row=8, column=0, columnspan=3, pady=8)
 
     def run(self):
         self.root.mainloop()
