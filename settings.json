@@ -1,0 +1,10 @@
+{
+  "Columns": 10,
+  "MaxRows": 4,
+  "IconSize": 16,
+  "IconSpacing": 4,
+  "TaskbarPos": "bottom-left",
+  "OffsetX": 50,
+  "OffsetY": 50,
+  "Order": []
+}

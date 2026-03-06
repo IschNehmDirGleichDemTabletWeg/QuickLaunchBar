@@ -1,14 +1,19 @@
 """
-QuickLaunchBar.py
+QuickLaunchBar.py  –  v1.1
 Zeigt alle Verknüpfungen aus dem Quick Launch Ordner als Icon-Leiste.
 Benötigt: pip install pillow pywin32
+
+Änderungen v1.1:
+  - Settings werden nicht mehr in der Registry gespeichert,
+    sondern in einer settings.json neben der EXE (portabel, kein Installer nötig)
+  - Migration: vorhandene Registry-Werte werden beim ersten Start automatisch übernommen
 """
 
 import os
 import sys
+import json
 import threading
 import subprocess
-import winreg
 import ctypes
 import tkinter as tk
 import tkinter.messagebox
@@ -20,97 +25,119 @@ import win32ui
 import win32con
 import win32api
 
-VERSION = "1.0"
+VERSION = "1.2"
 
 # ── Single Instance Guard ─────────────────────────────────────────────────────
 _MUTEX_NAME = "QuickLaunchBar_SingleInstance_Mutex"
 _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
 if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-    # Bereits eine Instanz aktiv → diese sofort beenden
     ctypes.windll.kernel32.CloseHandle(_mutex)
     sys.exit(0)
 
-REG_KEY = r"Software\QuickLaunchBar"
 
-def reg_get(name: str, default):
+# ── Settings (JSON) ───────────────────────────────────────────────────────────
+
+def _settings_path() -> str:
+    """settings.json liegt immer neben der EXE / dem Skript."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "settings.json")
+
+DEFAULTS = {
+    "Columns":     8,
+    "MaxRows":     0,
+    "IconSize":    32,
+    "IconSpacing": 2,
+    "TaskbarPos":  "bottom-right",
+    "OffsetX":     8,
+    "OffsetY":     50,
+    "Order":       [],   # manuelle Icon-Reihenfolge (Dateinamen)
+}
+
+_settings: dict = {}
+
+def _load_settings():
+    global _settings
+    path = _settings_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _settings = json.load(f)
+        except Exception:
+            _settings = {}
+    else:
+        _settings = {}
+        _migrate_from_registry()   # einmalige Migration
+    # Fehlende Schlüssel mit Defaults auffüllen
+    for k, v in DEFAULTS.items():
+        _settings.setdefault(k, v)
+
+def _save_settings():
     try:
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(_settings, f, indent=2, ensure_ascii=False)
+    except Exception as ex:
+        print(f"settings save error: {ex}")
+
+def cfg_get(name: str):
+    return _settings.get(name, DEFAULTS.get(name))
+
+def cfg_set(name: str, value):
+    _settings[name] = value
+    _save_settings()
+
+def _migrate_from_registry():
+    """Liest alte Registry-Werte und übernimmt sie in die neue JSON."""
+    try:
+        import winreg
+        REG_KEY = r"Software\QuickLaunchBar"
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY)
-        val, _ = winreg.QueryValueEx(key, name)
+        mapping = {
+            "Columns":     ("Columns",     int),
+            "MaxRows":     ("MaxRows",     int),
+            "IconSize":    ("IconSize",    int),
+            "IconSpacing": ("IconSpacing", int),
+            "TaskbarPos":  ("TaskbarPos",  str),
+            "OffsetX":     ("OffsetX",     int),
+            "OffsetY":     ("OffsetY",     int),
+        }
+        for reg_name, (json_name, typ) in mapping.items():
+            try:
+                val, _ = winreg.QueryValueEx(key, reg_name)
+                _settings[json_name] = typ(val)
+            except Exception:
+                pass
         winreg.CloseKey(key)
-        return val
+        print("Registry-Werte erfolgreich nach settings.json migriert.")
     except Exception:
-        return default
+        pass  # Keine Registry-Werte vorhanden – kein Problem
 
-def reg_set(name: str, value):
-    try:
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_KEY)
-        if isinstance(value, int):
-            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
-        else:
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
-        winreg.CloseKey(key)
-    except Exception:
-        pass
 
+# Settings beim Start laden
+_load_settings()
+
+
+# ── Konstanten ────────────────────────────────────────────────────────────────
 
 QUICK_LAUNCH = os.path.expandvars(
     r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch"
 )
 
-BTN_SIZE  = 36
-ICON_SIZE = 32
-PAD       = 6
-BG        = "#1c1c1c"
-BTN_NORM  = "#2d2d2d"
-BTN_HOVER = "#464646"
-BTN_PRESS = "#5f5f5f"
-BORDER    = "#4b4b4b"
+PAD      = 6
+BG       = "#1c1c1c"
+BTN_NORM = "#2d2d2d"
+BTN_HOVER= "#464646"
+BTN_PRESS= "#5f5f5f"
+BORDER   = "#4b4b4b"
 
 
 # ── Icon extraction ───────────────────────────────────────────────────────────
 
-def get_icon(path: str, index: int = 0):
+def best_icon(path: str, icon_size: int = 32):
+    """Lädt Icon direkt aus der .lnk wie Windows Explorer."""
     try:
-        large, small = win32gui.ExtractIconEx(path, index, 10)
-        if not large:
-            print(f"ExtractIconEx no icons: '{path}'")
-            return None
-
-        hicon = large[0]
-        for h in large[1:] + small:
-            try: win32gui.DestroyIcon(h)
-            except: pass
-
-        hdc_screen = win32gui.GetDC(0)
-        hdc        = win32ui.CreateDCFromHandle(hdc_screen)
-        hdc_mem    = hdc.CreateCompatibleDC()
-        hbmp       = win32ui.CreateBitmap()
-        hbmp.CreateCompatibleBitmap(hdc, ICON_SIZE, ICON_SIZE)
-        hdc_mem.SelectObject(hbmp)
-        hdc_mem.FillSolidRect((0, 0, ICON_SIZE, ICON_SIZE), 0x1c1c1c)
-        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon,
-                            ICON_SIZE, ICON_SIZE, 0, None, win32con.DI_NORMAL)
-
-        bmpinfo = hbmp.GetInfo()
-        bmpdata = hbmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            "RGBA",
-            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-            bmpdata, "raw", "BGRA", 0, 1
-        )
-
-        win32gui.DestroyIcon(hicon)
-        win32gui.ReleaseDC(0, hdc_screen)
-
-        return img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)  # PIL Image
-    except Exception as e:
-        print(f"get_icon EXCEPTION '{path}': {e}")
-        return None
-
-
-def _shell_icon(path: str):
-    try:
-        import ctypes
         from ctypes import wintypes
         shell32 = ctypes.windll.shell32
 
@@ -132,87 +159,7 @@ def _shell_icon(path: str):
             SHGFI_ICON | SHGFI_LARGEICON
         )
         if res and info.hIcon:
-            hicon = info.hIcon
-            hdc_screen = win32gui.GetDC(0)
-            hdc        = win32ui.CreateDCFromHandle(hdc_screen)
-            hdc_mem    = hdc.CreateCompatibleDC()
-            hbmp       = win32ui.CreateBitmap()
-            hbmp.CreateCompatibleBitmap(hdc, ICON_SIZE, ICON_SIZE)
-            hdc_mem.SelectObject(hbmp)
-            hdc_mem.FillSolidRect((0, 0, ICON_SIZE, ICON_SIZE), 0x1c1c1c)
-            win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon,
-                                ICON_SIZE, ICON_SIZE, 0, None, win32con.DI_NORMAL)
-            bmpinfo = hbmp.GetInfo()
-            bmpdata = hbmp.GetBitmapBits(True)
-            img = Image.frombuffer(
-                "RGBA",
-                (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-                bmpdata, "raw", "BGRA", 0, 1
-            )
-            win32gui.ReleaseDC(0, hdc_screen)
-            win32gui.DestroyIcon(hicon)
-            return img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)  # PIL Image
-    except Exception as e:
-        print(f"_shell_icon EXCEPTION '{path}': {e}")
-    return None
-
-
-def resolve_lnk(lnk_path: str):
-    """Gibt (target_path, icon_path, icon_index) zurück."""
-    try:
-        shell    = win32com.client.Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortcut(lnk_path)
-        loc      = shortcut.IconLocation
-        if "," in loc:
-            parts      = loc.rsplit(",", 1)
-            icon_path  = parts[0].strip()
-            try:    icon_index = int(parts[1].strip())
-            except: icon_index = 0
-        else:
-            icon_path  = loc.strip()
-            icon_index = 0
-
-        # TargetPath kann leer sein wenn Argumente enthalten sind
-        target = shortcut.TargetPath.strip()
-        if not target:
-            # Aus FullName / Arguments extrahieren
-            target = shortcut.FullName.strip()
-
-        return target, icon_path, icon_index
-    except Exception:
-        return "", "", 0
-
-
-def best_icon(lnk_path: str, icon_size: int = 32):
-    """Lädt Icon direkt aus der .lnk wie Windows Explorer – kein Target-Parsing nötig."""
-    return _shell_icon(lnk_path, icon_size)
-
-
-def _shell_icon(path: str, icon_size: int = 32):
-    try:
-        import ctypes
-        from ctypes import wintypes
-        shell32 = ctypes.windll.shell32
-
-        class SHFILEINFO(ctypes.Structure):
-            _fields_ = [
-                ("hIcon",         wintypes.HANDLE),
-                ("iIcon",         ctypes.c_int),
-                ("dwAttributes",  wintypes.DWORD),
-                ("szDisplayName", ctypes.c_wchar * 260),
-                ("szTypeName",    ctypes.c_wchar * 80),
-            ]
-
-        SHGFI_ICON      = 0x000000100
-        SHGFI_LARGEICON = 0x000000000
-
-        info = SHFILEINFO()
-        res  = shell32.SHGetFileInfoW(
-            path, 0, ctypes.byref(info), ctypes.sizeof(info),
-            SHGFI_ICON | SHGFI_LARGEICON
-        )
-        if res and info.hIcon:
-            hicon = info.hIcon
+            hicon      = info.hIcon
             hdc_screen = win32gui.GetDC(0)
             hdc        = win32ui.CreateDCFromHandle(hdc_screen)
             hdc_mem    = hdc.CreateCompatibleDC()
@@ -232,12 +179,12 @@ def _shell_icon(path: str, icon_size: int = 32):
             win32gui.ReleaseDC(0, hdc_screen)
             win32gui.DestroyIcon(hicon)
             return img.resize((icon_size, icon_size), Image.LANCZOS)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"best_icon EXCEPTION '{path}': {e}")
     return None
 
 
-# ── Icon Button (Frame+Label, zuverlässiges Image-Rendering) ──────────────────
+# ── Icon Button ───────────────────────────────────────────────────────────────
 
 class IconButton(tk.Frame):
     def __init__(self, parent, name, img, btn_size, on_click, on_right_click, **kw):
@@ -258,7 +205,7 @@ class IconButton(tk.Frame):
         lbl = tk.Label(self, bg=BTN_NORM, cursor="hand2")
         if img:
             lbl.configure(image=img)
-            lbl._img = img  # extra GC-Schutz direkt am Label
+            lbl._img = img
         else:
             lbl.configure(text=name[:4], fg="white", font=("Segoe UI", 7))
         lbl.place(relx=0.5, rely=0.5, anchor="center")
@@ -270,10 +217,11 @@ class IconButton(tk.Frame):
             w.bind("<ButtonRelease-1>", self._release)
             w.bind("<Button-3>",        self._right)
 
-        self._tip = None
+        self._tip     = None
+        self._tip_job = None
         for w in (self, lbl):
-            w.bind("<Enter>", self._tip_show, add="+")
-            w.bind("<Leave>", self._tip_hide, add="+")
+            w.bind("<Enter>", self._tip_schedule, add="+")
+            w.bind("<Leave>", self._tip_hide,     add="+")
 
     def _hover_on(self, e):
         self.configure(bg=BTN_HOVER)
@@ -290,13 +238,30 @@ class IconButton(tk.Frame):
     def _right(self, e):
         self._on_rclick(e)
 
-    def _tip_show(self, e):
+    def _tip_schedule(self, e):
+        self._tip_cancel()
+        self._tip_destroy()
+        self._tip_job = self.after(400, self._tip_show)
+
+    def _tip_cancel(self):
+        if self._tip_job:
+            self.after_cancel(self._tip_job)
+            self._tip_job = None
+
+    def _tip_destroy(self):
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+    def _tip_show(self):
+        self._tip_job = None
         if self._tip:
             return
-        x = self.winfo_rootx() + BTN_SIZE // 2
-        y = self.winfo_rooty() - 30
+        x = self.winfo_rootx() + self.winfo_width() // 2
+        y = self.winfo_rooty() - 28
         self._tip = tk.Toplevel(self)
         self._tip.wm_overrideredirect(True)
+        self._tip.wm_attributes("-topmost", True)
         self._tip.wm_geometry(f"+{x}+{y}")
         tk.Label(self._tip, text=self._name,
                  bg="#2d2d2d", fg="white",
@@ -304,12 +269,8 @@ class IconButton(tk.Frame):
                  relief="flat").pack()
 
     def _tip_hide(self, e):
-        # Nur verstecken wenn Maus wirklich den Button verlassen hat
-        x, y = self.winfo_rootx(), self.winfo_rooty()
-        if not (x <= e.x_root <= x + BTN_SIZE and y <= e.y_root <= y + BTN_SIZE):
-            if self._tip:
-                self._tip.destroy()
-                self._tip = None
+        self._tip_cancel()
+        self._tip_destroy()
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -327,31 +288,36 @@ class QuickLaunchBar:
         self.root.bind("<FocusOut>", self._on_focus_out)
         self.root.bind("<Escape>",   lambda e: self.root.withdraw())
 
-        # Border frame
         frame = tk.Frame(self.root, bg=BORDER, padx=1, pady=1)
         frame.pack(fill=tk.BOTH, expand=True)
 
         inner = tk.Frame(frame, bg=BG, padx=PAD, pady=PAD)
         inner.pack(fill=tk.BOTH, expand=True)
 
-        # Drag via inner frame
         inner.bind("<ButtonPress-1>", self._drag_start)
         inner.bind("<B1-Motion>",     self._drag_move)
 
         self._btn_frame = tk.Frame(inner, bg=BG)
         self._btn_frame.pack()
-        self._cols         = reg_get("Columns", 8)
-        self._max_rows     = reg_get("MaxRows", 0)
-        self._icon_size    = reg_get("IconSize", 32)
-        self._icon_spacing = reg_get("IconSpacing", 2)
-        self._tb_pos       = reg_get("TaskbarPos", "bottom-right")
-        self._offset_x     = reg_get("OffsetX", 8)
-        self._offset_y     = reg_get("OffsetY", 50)
 
-        self._images  = {}  # key=filename, value=ImageTk – niemals löschen (GC-Schutz)
+        self._reload_cfg()
+        self._images = {}
         self._load_shortcuts()
         self._position_window()
+        self.root.withdraw()   # beim Start versteckt – nur Tray sichtbar
         self._setup_tray()
+
+    def _reload_cfg(self):
+        """Liest alle Einstellungen aus dem Settings-Dict."""
+        self._cols         = cfg_get("Columns")
+        self._max_rows     = cfg_get("MaxRows")
+        self._icon_size    = cfg_get("IconSize")
+        self._icon_spacing = cfg_get("IconSpacing")
+        self._tb_pos       = cfg_get("TaskbarPos")
+        self._offset_x     = cfg_get("OffsetX")
+        self._offset_y     = cfg_get("OffsetY")
+
+    # ── Position & Drag ───────────────────────────────────────────────────────
 
     def _position_window(self):
         self.root.update_idletasks()
@@ -360,7 +326,6 @@ class QuickLaunchBar:
         mx = self.root.winfo_pointerx()
         my = self.root.winfo_pointery()
 
-        # Monitor ermitteln
         try:
             import screeninfo
             monitors = screeninfo.get_monitors()
@@ -373,21 +338,11 @@ class QuickLaunchBar:
             mw = self.root.winfo_screenwidth()
             mh = self.root.winfo_screenheight()
 
-        ox = self._offset_x
-        oy = self._offset_y
-        pos = self._tb_pos
-        if pos == "top-left":
-            x = mx0 + ox
-            y = my0 + oy
-        elif pos == "top-right":
-            x = mx0 + mw - w - ox
-            y = my0 + oy
-        elif pos == "bottom-left":
-            x = mx0 + ox
-            y = my0 + mh - h - oy
-        else:  # bottom-right (default)
-            x = mx0 + mw - w - ox
-            y = my0 + mh - h - oy
+        ox, oy, pos = self._offset_x, self._offset_y, self._tb_pos
+        if   pos == "top-left":     x, y = mx0 + ox,          my0 + oy
+        elif pos == "top-right":    x, y = mx0 + mw - w - ox, my0 + oy
+        elif pos == "bottom-left":  x, y = mx0 + ox,          my0 + mh - h - oy
+        else:                       x, y = mx0 + mw - w - ox, my0 + mh - h - oy
 
         self.root.geometry(f"+{x}+{y}")
 
@@ -413,7 +368,6 @@ class QuickLaunchBar:
     def _load_shortcuts(self):
         for w in self._btn_frame.winfo_children():
             w.destroy()
-        # _images NICHT leeren – GC-Schutz!
 
         if not os.path.exists(QUICK_LAUNCH):
             tk.Label(self._btn_frame,
@@ -422,23 +376,31 @@ class QuickLaunchBar:
             return
 
         EXTENSIONS = (".lnk", ".rdp", ".exe", ".bat", ".cmd", ".url")
-        files = sorted(
+        all_files = sorted(
             f for f in os.listdir(QUICK_LAUNCH)
             if os.path.splitext(f)[1].lower() in EXTENSIONS
             and os.path.isfile(os.path.join(QUICK_LAUNCH, f))
             and f.lower() != "desktop.ini"
         )
 
+        # Gespeicherte Reihenfolge anwenden
+        order = cfg_get("Order")
+        ordered = [f for f in order if f in all_files]
+        rest    = [f for f in all_files if f not in ordered]
+        files   = ordered + rest
+
         icon_size = self._icon_size
         btn_size  = icon_size + 8
+        sp        = self._icon_spacing
 
-        for col, filename in enumerate(files):
-            row = col // self._cols
+        for idx, filename in enumerate(files):
+            row = idx // self._cols
             if self._max_rows > 0 and row >= self._max_rows:
                 break
-            lnk      = os.path.join(QUICK_LAUNCH, filename)
-            name     = os.path.splitext(filename)[0]
-            pil_img  = best_icon(lnk, icon_size)
+            lnk  = os.path.join(QUICK_LAUNCH, filename)
+            name = os.path.splitext(filename)[0]
+
+            pil_img = best_icon(lnk, icon_size)
             img = ImageTk.PhotoImage(pil_img) if pil_img else None
             if img:
                 self._images[filename] = img
@@ -448,8 +410,7 @@ class QuickLaunchBar:
                 on_click       = lambda p=lnk: self._launch(p),
                 on_right_click = lambda e, p=lnk, n=name: self._ctx(e, p, n),
             )
-            sp = self._icon_spacing
-            btn.grid(row=row, column=col % self._cols, padx=sp, pady=sp)
+            btn.grid(row=row, column=idx % self._cols, padx=sp, pady=sp)
 
     def _launch(self, lnk_path):
         try:
@@ -512,42 +473,32 @@ class QuickLaunchBar:
         wc.lpszClassName = cls
         win32gui.RegisterClass(wc)
 
-        hwnd  = win32gui.CreateWindow(cls, "Tray", 0, 0, 0, 0, 0,
-                                      0, 0, wc.hInstance, None)
-        exe = sys.executable if getattr(sys, "frozen", False) else __file__
+        hwnd = win32gui.CreateWindow(cls, "Tray", 0, 0, 0, 0, 0,
+                                     0, 0, wc.hInstance, None)
+        self._tray_hwnd = hwnd
+        self._tray_id   = TRAY_ID
 
-        # Bei --onefile liegt die ICO im entpackten temp-Ordner (_MEIPASS)
+        exe      = sys.executable if getattr(sys, "frozen", False) else __file__
         base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(exe)))
         ico_path = os.path.join(base_dir, "quicklaunch.ico")
 
         hicon = None
-
-        # Versuch 1: ICO aus _MEIPASS oder Skript-Ordner laden
         if os.path.exists(ico_path):
             try:
                 hicon = win32gui.LoadImage(
-                    0, ico_path,
-                    win32con.IMAGE_ICON,
-                    16, 16,
-                    win32con.LR_LOADFROMFILE
-                )
+                    0, ico_path, win32con.IMAGE_ICON, 16, 16,
+                    win32con.LR_LOADFROMFILE)
             except Exception:
                 hicon = None
 
-        # Versuch 2: Icon aus EXE-Ressource (funktioniert bei --onedir)
         if not hicon:
             try:
                 hicon = win32gui.LoadImage(
-                    win32api.GetModuleHandle(None),
-                    1,
-                    win32con.IMAGE_ICON,
-                    16, 16,
-                    win32con.LR_DEFAULTCOLOR
-                )
+                    win32api.GetModuleHandle(None), 1,
+                    win32con.IMAGE_ICON, 16, 16, win32con.LR_DEFAULTCOLOR)
             except Exception:
                 hicon = None
 
-        # Versuch 3: ExtractIconEx aus der EXE
         if not hicon:
             try:
                 large, small = win32gui.ExtractIconEx(exe, 0)
@@ -558,9 +509,9 @@ class QuickLaunchBar:
             except Exception:
                 hicon = None
 
-        # Fallback: Windows-Standard-Icon
         if not hicon:
             hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+
         win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, (
             hwnd, TRAY_ID,
             win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
@@ -581,12 +532,14 @@ class QuickLaunchBar:
                        activeforeground="white")
         menu.add_command(label=f"Quick Launch Bar v{VERSION}", state="disabled")
         menu.add_separator()
-        menu.add_command(label="Reload",    command=self._load_shortcuts)
+        menu.add_command(label="Reload",      command=self._load_shortcuts)
         menu.add_command(label="Settings...", command=self._show_settings)
         menu.add_separator()
-        menu.add_command(label="Exit",      command=self.root.quit)
+        menu.add_command(label="Exit",        command=self._quit)
         menu.tk_popup(self.root.winfo_pointerx(),
                       self.root.winfo_pointery())
+
+    # ── Settings window ───────────────────────────────────────────────────────
 
     def _show_settings(self):
         win = tk.Toplevel(self.root)
@@ -595,13 +548,16 @@ class QuickLaunchBar:
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
-        win.update_idletasks()
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        w, h = 340, 300
-        win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-        # pady halbiert: von 5 auf 2
+        def _center():
+            win.update_idletasks()
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            win.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+        win.after(10, _center)
+
         pad = dict(padx=12, pady=2)
 
         def spinbox(parent, var, from_, to):
@@ -609,35 +565,30 @@ class QuickLaunchBar:
                               bg="#3d3d3d", fg="white", buttonbackground="#3d3d3d",
                               insertbackground="white")
 
-        # Row 0 – Columns
         tk.Label(win, text="Columns:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", **pad)
-        var_cols = tk.IntVar(value=reg_get("Columns", 8))
+        var_cols = tk.IntVar(value=cfg_get("Columns"))
         spinbox(win, var_cols, 1, 20).grid(row=0, column=1, sticky="w", **pad)
 
-        # Row 1 – Max Rows
         tk.Label(win, text="Max Rows:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", **pad)
-        var_rows = tk.IntVar(value=reg_get("MaxRows", 0))
+        var_rows = tk.IntVar(value=cfg_get("MaxRows"))
         spinbox(win, var_rows, 0, 20).grid(row=1, column=1, sticky="w", **pad)
         tk.Label(win, text="(0 = auto)", bg="#2d2d2d", fg="#888888",
                  font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w")
 
-        # Row 2 – Icon Size
         tk.Label(win, text="Icon Size:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", **pad)
-        var_icon = tk.StringVar(value=str(reg_get("IconSize", 32)))
+        var_icon = tk.StringVar(value=str(cfg_get("IconSize")))
         ttk.Combobox(win, textvariable=var_icon,
                      values=["8", "12", "16", "20", "24", "28", "32", "48"],
                      width=6, state="readonly").grid(row=2, column=1, sticky="w", **pad)
 
-        # Row 3 – Icon Spacing
         tk.Label(win, text="Icon Spacing (px):", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=3, column=0, sticky="w", **pad)
-        var_spacing = tk.IntVar(value=reg_get("IconSpacing", 2))
+        var_spacing = tk.IntVar(value=cfg_get("IconSpacing"))
         spinbox(win, var_spacing, 0, 20).grid(row=3, column=1, sticky="w", **pad)
 
-        # Row 4 – Taskbar Position (width=12 → Dropdown breit genug)
         tk.Label(win, text="Taskbar Position:", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=4, column=0, sticky="w", **pad)
         tb_options = {
@@ -647,45 +598,37 @@ class QuickLaunchBar:
             "Bottom Right": "bottom-right",
         }
         pos_display   = {v: k for k, v in tb_options.items()}
-        var_pos_label = tk.StringVar(value=pos_display.get(reg_get("TaskbarPos", "bottom-right"), "Bottom Right"))
+        var_pos_label = tk.StringVar(
+            value=pos_display.get(cfg_get("TaskbarPos"), "Bottom Right"))
         ttk.Combobox(win, textvariable=var_pos_label,
                      values=list(tb_options.keys()),
                      width=12, state="readonly").grid(row=4, column=1, columnspan=2,
                                                       sticky="w", **pad)
 
-        # Row 5 – Offset X
         tk.Label(win, text="Offset X (px):", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=5, column=0, sticky="w", **pad)
-        var_ox = tk.IntVar(value=reg_get("OffsetX", 8))
+        var_ox = tk.IntVar(value=cfg_get("OffsetX"))
         spinbox(win, var_ox, 0, 500).grid(row=5, column=1, sticky="w", **pad)
 
-        # Row 6 – Offset Y
         tk.Label(win, text="Offset Y (px):", bg="#2d2d2d", fg="white",
                  font=("Segoe UI", 9)).grid(row=6, column=0, sticky="w", **pad)
-        var_oy = tk.IntVar(value=reg_get("OffsetY", 50))
+        var_oy = tk.IntVar(value=cfg_get("OffsetY"))
         spinbox(win, var_oy, 0, 500).grid(row=6, column=1, sticky="w", **pad)
 
-        # Row 7 – Hinweis
         tk.Label(win, text="⚠ If columns/rows are too small,\n   not all shortcuts may be shown.",
                  bg="#2d2d2d", fg="#aaaaaa",
                  font=("Segoe UI", 8), justify="left").grid(
                  row=7, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w")
 
         def on_ok():
-            reg_set("Columns",     var_cols.get())
-            reg_set("MaxRows",     var_rows.get())
-            reg_set("IconSize",    int(var_icon.get()))
-            reg_set("IconSpacing", var_spacing.get())
-            reg_set("TaskbarPos",  tb_options[var_pos_label.get()])
-            reg_set("OffsetX",     var_ox.get())
-            reg_set("OffsetY",     var_oy.get())
-            self._cols         = var_cols.get()
-            self._max_rows     = var_rows.get()
-            self._icon_size    = int(var_icon.get())
-            self._icon_spacing = var_spacing.get()
-            self._tb_pos       = tb_options[var_pos_label.get()]
-            self._offset_x     = var_ox.get()
-            self._offset_y     = var_oy.get()
+            cfg_set("Columns",     var_cols.get())
+            cfg_set("MaxRows",     var_rows.get())
+            cfg_set("IconSize",    int(var_icon.get()))
+            cfg_set("IconSpacing", var_spacing.get())
+            cfg_set("TaskbarPos",  tb_options[var_pos_label.get()])
+            cfg_set("OffsetX",     var_ox.get())
+            cfg_set("OffsetY",     var_oy.get())
+            self._reload_cfg()
             self._load_shortcuts()
             win.destroy()
 
@@ -693,6 +636,16 @@ class QuickLaunchBar:
                   bg="#464646", fg="white", relief="flat",
                   activebackground="#5a5a5a",
                   cursor="hand2").grid(row=8, column=0, columnspan=3, pady=8)
+
+    def _quit(self):
+        """Tray-Icon sauber entfernen bevor das Fenster geschlossen wird."""
+        try:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (
+                self._tray_hwnd, self._tray_id,
+                win32gui.NIF_ICON, 0, 0, ""))
+        except Exception:
+            pass
+        self.root.quit()
 
     def run(self):
         self.root.mainloop()
